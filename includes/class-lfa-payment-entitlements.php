@@ -38,7 +38,7 @@ final class LFA_Payment_Entitlements {
             return true;
         }
         $status = (string) get_user_meta($user_id, 'lfa_account_status', true);
-        return in_array($status, ['approved', 'email_verified'], true);
+        return in_array($status, ['approved', 'email_verified', 'pending_approval'], true);
     }
 
     /**
@@ -319,15 +319,18 @@ final class LFA_Payment_Entitlements {
 
         if (!self::is_account_approved($user_id)) {
             return [
-                'state'       => 'pending_approval',
+                'state'       => 'general_user',
                 'eligible'    => false,
-                'title'       => 'Account Approval Pending',
-                'message'     => 'Your alumni account is pending administrator approval. Conference registration opens once approved and annual dues are activated.',
+                'title'       => 'Active Membership Required',
+                'message'     => 'Become an active Love Family Alumni member to register for this conference.',
                 'primary_cta' => [
-                    'label' => 'My Dashboard',
-                    'url'   => home_url('/member-dashboard/'),
+                    'label' => 'Purchase Membership — $100/year',
+                    'url'   => home_url('/membership/'),
                 ],
-                'secondary_cta' => null,
+                'secondary_cta' => [
+                    'label' => 'Back to Conference',
+                    'url'   => home_url('/conference/2027/'),
+                ],
             ];
         }
 
@@ -340,29 +343,29 @@ final class LFA_Payment_Entitlements {
                 'title'       => 'Renew Membership to Register',
                 'message'     => 'Your annual Love Family Alumni membership has expired. Renew your $100 annual dues to restore access and register for this conference.',
                 'primary_cta' => [
-                    'label' => 'Renew Membership',
-                    'url'   => home_url('/member-dashboard/#membership-renewal'),
+                    'label' => 'Renew Membership — $100',
+                    'url'   => home_url('/membership/'),
                 ],
                 'secondary_cta' => [
-                    'label' => 'My Dashboard',
-                    'url'   => home_url('/member-dashboard/'),
+                    'label' => 'Back to Conference',
+                    'url'   => home_url('/conference/2027/'),
                 ],
             ];
         }
 
         if (empty($dues['is_paid']) || $dues['standing'] !== 'current') {
             return [
-                'state'       => 'approved_unpaid',
+                'state'       => 'general_user',
                 'eligible'    => false,
-                'title'       => 'Activate Your Membership First',
-                'message'     => 'You must complete your $100 annual membership dues before registering for this conference.',
+                'title'       => 'Active Membership Required',
+                'message'     => 'Become an active Love Family Alumni member to register for this conference.',
                 'primary_cta' => [
-                    'label' => 'Pay Annual Dues',
-                    'url'   => home_url('/member-dashboard/#annual-dues'),
+                    'label' => 'Purchase Membership — $100/year',
+                    'url'   => home_url('/membership/'),
                 ],
                 'secondary_cta' => [
-                    'label' => 'My Dashboard',
-                    'url'   => home_url('/member-dashboard/'),
+                    'label' => 'Back to Conference',
+                    'url'   => home_url('/conference/2027/'),
                 ],
             ];
         }
@@ -665,5 +668,31 @@ final class LFA_Payment_Entitlements {
         }
 
         return ['success' => false, 'error' => 'Payable not found.'];
+    }
+
+    /**
+     * Authoritative check for current active paid membership.
+     * Evaluates valid user, required approval, membership period, verified payment, and UTC expiration.
+     */
+    public static function has_active_membership(int $user_id, bool $allow_staging_test = true): bool {
+        return self::is_full_member($user_id, $allow_staging_test);
+    }
+}
+
+/**
+ * Universal Global Helper: Check if a user has active paid membership.
+ */
+if (!function_exists('lfa_user_has_active_membership')) {
+    function lfa_user_has_active_membership(int $user_id = 0, bool $allow_staging_test = true): bool {
+        if ($user_id <= 0) {
+            $user_id = get_current_user_id();
+        }
+        if ($user_id <= 0) {
+            return false;
+        }
+        if (class_exists('LFA_Payment_Entitlements')) {
+            return LFA_Payment_Entitlements::has_active_membership($user_id, $allow_staging_test);
+        }
+        return false;
     }
 }

@@ -104,6 +104,13 @@ final class LFA_Payment_REST {
             'callback'            => [__CLASS__, 'handle_renew_membership'],
             'permission_callback' => [__CLASS__, 'check_auth_permission'],
         ]);
+
+        // Issue or Retrieve Current Membership Purchase Invoice for General User
+        register_rest_route(self::NAMESPACE, '/payments/purchase-membership', [
+            'methods'             => 'POST',
+            'callback'            => [__CLASS__, 'handle_purchase_membership'],
+            'permission_callback' => [__CLASS__, 'check_auth_permission'],
+        ]);
     }
 
     public static function check_auth_permission(WP_REST_Request $request): bool {
@@ -466,6 +473,36 @@ HTML;
             'currency'       => $inv->currency,
             'status'         => $inv->status,
             'message'        => 'Annual membership dues renewal invoice generated successfully ($100.00 USD).',
+        ], 200);
+    }
+
+    public static function handle_purchase_membership(WP_REST_Request $request): WP_REST_Response {
+        $user_id = get_current_user_id();
+        if ($user_id <= 0) {
+            return new WP_REST_Response(['success' => false, 'error' => 'Authentication required.'], 401);
+        }
+
+        $res = LFA_Membership::purchase_membership($user_id);
+        if (!$res['success']) {
+            $code = $res['code'] ?? 'PURCHASE_FAILED';
+            $status = ($code === 'APPROVAL_PENDING') ? 403 : 400;
+            return new WP_REST_Response([
+                'success' => false,
+                'error'   => $res['error'],
+                'code'    => $code,
+            ], $status);
+        }
+
+        $inv = $res['invoice'];
+        return new WP_REST_Response([
+            'success'        => true,
+            'invoice_id'     => (int) $inv->id,
+            'invoice_number' => $inv->invoice_number,
+            'amount_cents'   => (int) $inv->amount_cents,
+            'amount_dollars' => number_format($inv->amount_cents / 100, 2),
+            'currency'       => $inv->currency,
+            'status'         => $inv->status,
+            'message'        => 'Annual membership invoice generated successfully ($100.00 USD).',
         ], 200);
     }
 }

@@ -570,6 +570,42 @@ final class LFA_Membership {
     }
 
     /**
+     * Creates or retrieves a $100 Annual Membership dues invoice for a General User to purchase membership.
+     * Enforces eligibility / approval check, prevents duplicate invoices, and prevents purchase if already active paid.
+     */
+    public static function purchase_membership(int $user_id): array {
+        if ($user_id <= 0) {
+            return ['success' => false, 'error' => 'Valid user required.'];
+        }
+
+        // Check if user already has an active paid membership
+        if (class_exists('LFA_Payment_Entitlements') && LFA_Payment_Entitlements::is_full_member($user_id, true)) {
+            return [
+                'success' => false,
+                'error'   => 'Your annual membership is already active. Duplicate payment is not permitted for the active period.',
+                'code'    => 'ALREADY_ACTIVE',
+            ];
+        }
+
+        // Validate alumni approval / eligibility if required
+        if (class_exists('LFA_Payment_Entitlements') && !LFA_Payment_Entitlements::is_account_approved($user_id)) {
+            return [
+                'success' => false,
+                'error'   => 'Your alumni account is awaiting administrator review before membership dues can be activated.',
+                'code'    => 'APPROVAL_PENDING',
+            ];
+        }
+
+        $mem = self::get_or_create_membership($user_id);
+        if (!$mem) {
+            return ['success' => false, 'error' => 'Could not initialize membership record.'];
+        }
+
+        // Issue or retrieve idempotent $100 invoice
+        return self::issue_invoice((int) $mem->id, $user_id, 'Annual Membership Dues ($100.00 USD)');
+    }
+
+    /**
      * Issue renewal invoice for an expired or renewing member
      */
     public static function renew_membership(int $user_id, int $actor_id = 0): ?object {

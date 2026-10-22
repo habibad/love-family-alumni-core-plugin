@@ -50,14 +50,14 @@ final class LFA_Auth {
               <p><label>Volunteer interests <input name="volunteer_interests" maxlength="350"></label></p>
               <p><label>Biography <textarea name="biography" maxlength="2500"></textarea></label></p>
             </fieldset>
-            <fieldset><legend>Membership information</legend>
-              <p><label>Membership Package <input type="text" readonly value="Annual Membership ($100/year)" style="background:#f1f5f9;"></label></p>
-              <input type="hidden" name="membership_type" value="individual">
+            <fieldset><legend>Account Information</legend>
+              <p><label>Account Type <input type="text" readonly value="Free General User Account" style="background:#f1f5f9;"></label></p>
+              <input type="hidden" name="membership_type" value="general">
               <p><label>Profile visibility <select name="profile_visibility"><option value="private">Private (recommended)</option><option value="members">Members Only</option><option value="public">Public</option></select></label></p>
-              <p><label><input type="checkbox" name="accept_privacy" value="1" required> I agree to submit my details for membership review and acknowledge the site's published privacy notice.</label></p>
-              <p><button type="submit">Submit membership registration</button></p>
+              <p><label><input type="checkbox" name="accept_privacy" value="1" required> I agree to submit my details and acknowledge the site's published privacy notice.</label></p>
+              <p><button type="submit">Create General User Account</button></p>
             </fieldset>
-            <p>After email verification, an administrator must approve your account. No dues are charged at this step.</p>
+            <p>After email verification, you can log in to your General User Dashboard. Annual membership ($100/yr) can be upgraded from the Membership page.</p>
           </form>
         </section>
         <?php return (string) ob_get_clean();
@@ -85,15 +85,10 @@ final class LFA_Auth {
         if ($status === 'pending_email') {
             return new WP_Error('lfa_pending_email', __('Your email address has not been verified yet. Please check your inbox for the verification link.', 'love-family-core'));
         }
-        if ($status === 'pending_approval') {
-            return new WP_Error('lfa_pending_approval', __('Your alumni membership is awaiting administrator approval. You will receive an email once approved.', 'love-family-core'));
-        }
         if ($status === 'rejected') {
-            return new WP_Error('lfa_rejected', __('Your alumni membership application was not approved. Please contact the membership team for details.', 'love-family-core'));
+            return new WP_Error('lfa_rejected', __('Your account registration was not approved. Please contact the membership team for details.', 'love-family-core'));
         }
-        if ($status !== 'approved') {
-            return new WP_Error('lfa_pending', __('Your alumni account is not approved yet. Check your email or contact the membership team.', 'love-family-core'));
-        }
+        // General Users with verified email can log in to their limited General User Dashboard
         return $user;
     }
 
@@ -216,8 +211,8 @@ final class LFA_Auth {
             $bio = LFA_Core::input('intro');
         }
         update_user_meta((int) $uid, 'lfa_biography', $bio);
-        // Single Authoritative Membership package ($100/yr)
-        update_user_meta((int) $uid, 'lfa_membership_type', 'individual');
+        // Free General User account created; paid membership upgrade ($100/yr) is purchased separately
+        update_user_meta((int) $uid, 'lfa_membership_type', 'general');
 
         $visibility = LFA_Core::input('profile_visibility', LFA_Core::input('directory_privacy'));
         if ($visibility === 'members_only') { $visibility = 'members'; }
@@ -305,9 +300,9 @@ final class LFA_Auth {
         $user = wp_get_current_user();
         $status = LFA_Core::member_status((int) $user->ID);
 
-        // Pending or rejected members should not be bounced to dashboard where they would be denied
+        // Only rejected accounts should be prevented from reaching the dashboard
         if (!user_can($user, 'manage_options') && !user_can($user, 'lfa_view_admin_portal')) {
-            if ($status !== 'approved' && get_user_meta((int) $user->ID, 'lfa_account_approved', true) !== '1') {
+            if ($status === 'rejected') {
                 return;
             }
         }
@@ -433,6 +428,7 @@ final class LFA_Auth {
 
         delete_user_meta($uid, 'lfa_verify_hash');
         delete_user_meta($uid, 'lfa_verify_expires');
+        update_user_meta($uid, 'lfa_email_verified', '1');
         update_user_meta($uid, LFA_Core::META_STATUS, 'pending_approval');
 
         $user = get_user_by('id', $uid);

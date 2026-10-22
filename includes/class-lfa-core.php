@@ -122,8 +122,14 @@ final class LFA_Core {
 
     public static function can_use_portal(): bool {
         if (!is_user_logged_in()) { return false; }
-        if (current_user_can('manage_options')) { return true; }
-        return self::is_approved(get_current_user_id());
+        if (current_user_can('manage_options') || current_user_can('edit_users')) { return true; }
+        $uid = get_current_user_id();
+        $status = self::member_status($uid);
+        // Only unverified email or explicitly rejected accounts are denied portal access
+        if ($status === 'pending_email' || $status === 'rejected') {
+            return false;
+        }
+        return true;
     }
 
     public static function protect_portal(): void {
@@ -131,10 +137,20 @@ final class LFA_Core {
         if (!is_page(['member-dashboard', 'member-portal'])) { return; }
         if (self::can_use_portal()) { return; }
         $current_url = home_url(add_query_arg([], $GLOBALS['wp']->request ?? 'member-dashboard'));
-        $login_url = add_query_arg([
-            'lfa_notice'  => 'login_required',
-            'redirect_to' => rawurlencode($current_url),
-        ], home_url('/member-login/'));
+        if (!is_user_logged_in()) {
+            $login_url = add_query_arg([
+                'lfa_notice'  => 'login_required',
+                'redirect_to' => rawurlencode($current_url),
+            ], home_url('/member-login/'));
+        } else {
+            $uid = get_current_user_id();
+            $status = self::member_status($uid);
+            $notice = $status === 'pending_email' ? 'login_pending_email' : ($status === 'rejected' ? 'login_rejected' : 'login_required');
+            $login_url = add_query_arg([
+                'lfa_notice'  => $notice,
+                'redirect_to' => rawurlencode($current_url),
+            ], home_url('/member-login/'));
+        }
         wp_safe_redirect($login_url);
         exit;
     }
