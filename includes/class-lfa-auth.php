@@ -51,9 +51,8 @@ final class LFA_Auth {
               <p><label>Biography <textarea name="biography" maxlength="2500"></textarea></label></p>
             </fieldset>
             <fieldset><legend>Membership information</legend>
-              <p><label>Membership type * <select name="membership_type" required><option value="individual">Individual</option><option value="couple">Couple</option></select></label></p>
-              <p><label>Partner name (for couple applications) <input name="partner_name" maxlength="150"></label></p>
-              <p><label>Partner email (for couple applications) <input name="partner_email" type="email" maxlength="190"></label></p>
+              <p><label>Membership Package <input type="text" readonly value="Annual Membership ($100/year)" style="background:#f1f5f9;"></label></p>
+              <input type="hidden" name="membership_type" value="individual">
               <p><label>Profile visibility <select name="profile_visibility"><option value="private">Private (recommended)</option><option value="members">Members Only</option><option value="public">Public</option></select></label></p>
               <p><label><input type="checkbox" name="accept_privacy" value="1" required> I agree to submit my details for membership review and acknowledge the site's published privacy notice.</label></p>
               <p><button type="submit">Submit membership registration</button></p>
@@ -217,22 +216,8 @@ final class LFA_Auth {
             $bio = LFA_Core::input('intro');
         }
         update_user_meta((int) $uid, 'lfa_biography', $bio);
-
-        $type = LFA_Core::input('membership_type');
-        if (empty($type)) {
-            $type = LFA_Core::input('membership_tier');
-        }
-        $type = LFA_Core::choices($type, ['individual', 'couple'], 'individual');
-        update_user_meta((int) $uid, 'lfa_membership_type', $type);
-
-        if ($type === 'couple') {
-            $partner_name = LFA_Core::input('partner_name', LFA_Core::input('spouse_name'));
-            update_user_meta((int) $uid, 'lfa_partner_name', $partner_name);
-            $partner_email = sanitize_email(LFA_Core::input('partner_email', LFA_Core::input('spouse_email')));
-            if ($partner_email && is_email($partner_email)) {
-                update_user_meta((int) $uid, 'lfa_partner_email', $partner_email);
-            }
-        }
+        // Single Authoritative Membership package ($100/yr)
+        update_user_meta((int) $uid, 'lfa_membership_type', 'individual');
 
         $visibility = LFA_Core::input('profile_visibility', LFA_Core::input('directory_privacy'));
         if ($visibility === 'members_only') { $visibility = 'members'; }

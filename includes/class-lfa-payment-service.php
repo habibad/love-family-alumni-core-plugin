@@ -418,6 +418,15 @@ final class LFA_Payment_Service {
                 return ['valid' => false, 'code' => 'REGISTRATION_NOT_FOUND', 'error' => 'Associated conference registration was not found.'];
             }
 
+            // Strict Conference Access Control: Verify active paid membership at checkout initiation
+            if (class_exists('LFA_Payment_Entitlements') && !LFA_Payment_Entitlements::is_full_member((int)$inv->user_id, true)) {
+                return [
+                    'valid' => false,
+                    'code'  => 'MEMBERSHIP_REQUIRED',
+                    'error' => 'Active paid membership is required to pay and confirm conference registration.',
+                ];
+            }
+
             return ['valid' => true, 'invoice' => $inv, 'registration' => $reg, 'payable_type' => 'conference'];
         }
 
@@ -446,19 +455,10 @@ final class LFA_Payment_Service {
             return ['valid' => false, 'code' => 'ACCOUNT_NOT_APPROVED', 'error' => 'Member account must be verified and administrator-approved before dues payment.'];
         }
 
-        // Verify membership record and couple policy
+        // Verify membership record exists
         $mem = LFA_Membership::get_membership_by_user($user_id);
         if (!$mem) {
             return ['valid' => false, 'code' => 'NO_MEMBERSHIP', 'error' => 'No active membership record found for member.'];
-        }
-
-        $policy = LFA_Membership::get_policy();
-        if ($mem->membership_type === 'couple' && empty($policy['couple_base_cents'])) {
-            return [
-                'valid' => false,
-                'code'  => 'COUPLE_POLICY_UNCONFIGURED',
-                'error' => 'Couple Membership annual dues fee is pending administrator policy confirmation. Checkout will open once the rate is finalized.',
-            ];
         }
 
         // Verify billing period integrity
@@ -794,7 +794,11 @@ final class LFA_Payment_Service {
         }
 
         // Membership dues settlement
-        $wpdb->update($t_inv, ['status' => LFA_Membership::INVOICE_STATUS_PAID], ['id' => $invoice->id]);
+        $wpdb->update($t_inv, [
+            'status'     => LFA_Membership::INVOICE_STATUS_PAID,
+            'paid_at'    => $now,
+            'updated_at' => $now,
+        ], ['id' => $invoice->id]);
 
         $t_mem = LFA_Membership::table_memberships();
         $wpdb->update($t_mem, [
@@ -802,13 +806,43 @@ final class LFA_Payment_Service {
             'updated_at' => $now,
         ], ['user_id' => $user_id]);
 
-        if (!empty($invoice->period_id)) {
-            $t_per = LFA_Membership::table_periods();
+        $one_year_later = LFA_Membership::calculate_calendar_year_expiry($now);
+        $period_id = (int)$invoice->period_id;
+        $t_per = LFA_Membership::table_periods();
+        if ($period_id <= 0) {
+            $mem_row = $wpdb->get_row($wpdb->prepare("SELECT id FROM {$t_mem} WHERE user_id = %d", $user_id));
+            if ($mem_row) {
+                $existing_per = $wpdb->get_row($wpdb->prepare("SELECT id FROM {$t_per} WHERE membership_id = %d ORDER BY id DESC LIMIT 1", $mem_row->id));
+                if ($existing_per) {
+                    $period_id = (int)$existing_per->id;
+                } else {
+                    $current_year = (int) gmdate('Y', strtotime($now));
+                    $period_key = $current_year . '/' . ($current_year + 1);
+                    $wpdb->insert($t_per, [
+                        'membership_id' => $mem_row->id,
+                        'period_key'    => $period_key,
+                        'standing'      => LFA_Membership::STANDING_CURRENT,
+                        'starts_at'     => $now,
+                        'ends_at'       => $one_year_later,
+                        'created_at'    => $now,
+                        'updated_at'    => $now,
+                    ]);
+                    $period_id = (int) $wpdb->insert_id;
+                }
+                $wpdb->update($t_inv, ['period_id' => $period_id], ['id' => $invoice->id]);
+            }
+        }
+
+        if ($period_id > 0) {
             $wpdb->update($t_per, [
                 'standing'   => LFA_Membership::STANDING_CURRENT,
+                'starts_at'  => $now,
+                'ends_at'    => $one_year_later,
                 'updated_at' => $now,
-            ], ['id' => (int)$invoice->period_id]);
+            ], ['id' => $period_id]);
         }
+
+        update_user_meta($user_id, 'lfa_dues_status', 'current');
 
         self::log_audit('member', $user_id, 'payment_settled', (string)$invoice->id, [
             'invoice_number' => $invoice->invoice_number,

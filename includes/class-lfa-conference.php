@@ -785,21 +785,20 @@ final class LFA_Conference {
             ];
         }
 
-        // 2. Ownership & Eligibility
-        $is_guest = ($user_id === 0);
+        // 2. Ownership & Strict Paid-Member Eligibility
+        $is_guest = ($user_id <= 0);
         if ($is_guest) {
-            if ((int)$conf->guest_registration_enabled !== 1) {
-                return [
-                    'valid' => false,
-                    'code'  => 'GUEST_REGISTRATION_DISABLED',
-                    'error' => 'Guest registration is currently disabled. Please sign in with an approved Alumni Member account.',
-                ];
-            }
-            $guest_email = sanitize_email($input['guest_email'] ?? '');
-            if (empty($guest_email) || !is_email($guest_email)) {
-                return ['valid' => false, 'code' => 'INVALID_GUEST_EMAIL', 'error' => 'A valid guest email address is required.'];
-            }
-        } else {
+            return [
+                'valid' => false,
+                'code'  => 'MEMBERSHIP_REQUIRED',
+                'error' => 'Conference registration is available exclusively to active Love Family Alumni members.',
+            ];
+        }
+
+        // Administrator bypass for platform management
+        $is_admin = user_can($user_id, 'manage_options') || user_can($user_id, 'edit_users');
+
+        if (!$is_admin) {
             // Check member status
             $member_status = LFA_Core::member_status($user_id);
             if ($member_status !== 'approved') {
@@ -808,6 +807,25 @@ final class LFA_Conference {
                     'code'  => 'ACCOUNT_NOT_APPROVED',
                     'error' => 'Your alumni membership account must be verified and administrator-approved before registering for the conference.',
                 ];
+            }
+
+            // Check active paid dues entitlement
+            if (class_exists('LFA_Payment_Entitlements')) {
+                $dues = LFA_Payment_Entitlements::get_dues_standing($user_id, true);
+                if ($dues['standing'] === 'expired') {
+                    return [
+                        'valid' => false,
+                        'code'  => 'MEMBERSHIP_EXPIRED',
+                        'error' => 'Your annual membership has expired. Renew your $100 annual dues to register for this conference.',
+                    ];
+                }
+                if (empty($dues['is_paid']) || $dues['standing'] !== 'current') {
+                    return [
+                        'valid' => false,
+                        'code'  => 'MEMBERSHIP_UNPAID',
+                        'error' => 'You must complete your $100 annual membership dues before registering for this conference.',
+                    ];
+                }
             }
         }
 
@@ -822,22 +840,13 @@ final class LFA_Conference {
             return ['valid' => false, 'code' => 'TICKET_INACTIVE', 'error' => 'Selected ticket category is not currently active for enrollment.'];
         }
 
-        // Eligibility check: members_only ticket requires full paid membership standing
-        if ($ticket->eligibility === 'members_only') {
-            if ($is_guest) {
-                return [
-                    'valid' => false,
-                    'code'  => 'MEMBERSHIP_REQUIRED',
-                    'error' => 'This ticket category is reserved for verified alumni members in good standing. Please sign in.',
-                ];
-            }
-            if (class_exists('LFA_Payment_Entitlements') && !LFA_Payment_Entitlements::is_full_member($user_id) && !user_can($user_id, 'manage_options')) {
-                return [
-                    'valid' => false,
-                    'code'  => 'MEMBERSHIP_DUES_REQUIRED',
-                    'error' => 'This ticket category is reserved for active alumni members in good financial standing. Please settle your annual dues ($100.00 USD) to register.',
-                ];
-            }
+        // Eligibility check: conference attendance requires active paid membership standing
+        if (!$is_admin && class_exists('LFA_Payment_Entitlements') && !LFA_Payment_Entitlements::is_full_member($user_id, true)) {
+            return [
+                'valid' => false,
+                'code'  => 'MEMBERSHIP_DUES_REQUIRED',
+                'error' => 'Conference registration is reserved for active alumni members in good financial standing. Please settle your annual dues ($100.00 USD) to register.',
+            ];
         }
 
         if (is_null($ticket->amount_cents) || (int)$ticket->amount_cents <= 0) {
@@ -1074,13 +1083,48 @@ final class LFA_Conference {
         }
 
         $now = current_time('mysql', true);
+        $user_id = (int)$inv->user_id;
 
-        // 1. Mark Invoice Paid
+        // Recheck member eligibility at confirmation instant (Phase 08 requirement)
+        $is_eligible = false;
+        if ($user_id > 0) {
+            if (user_can($user_id, 'manage_options') || user_can($user_id, 'edit_users')) {
+                $is_eligible = true;
+            } elseif (class_exists('LFA_Payment_Entitlements')) {
+                $is_eligible = LFA_Payment_Entitlements::is_full_member($user_id, true);
+            }
+        }
+
+        // 1. Mark Invoice Paid (preserve capture record unconditionally)
         $wpdb->update($t_inv, [
             'status'     => self::INVOICE_STATUS_PAID,
             'paid_at'    => $now,
             'updated_at' => $now,
         ], ['id' => $invoice_id]);
+
+        if (!$is_eligible) {
+            // Payment captured, but member eligibility lapsed before confirmation.
+            // Hold registration for administrator review; do not discard capture.
+            $wpdb->update($t_reg, [
+                'status'     => 'flagged_eligibility_lapsed',
+                'updated_at' => $now,
+            ], ['id' => $inv->registration_id]);
+
+            self::log_audit('system', $user_id ?: null, 'conference_settle_eligibility_lapsed', 'registration', (string)$inv->registration_id, [
+                'invoice_number' => $inv->invoice_number,
+                'capture_id'     => $capture_id,
+                'amount_cents'   => $amount_cents,
+                'note'           => 'Payment was captured, but active paid member eligibility lapsed before confirmation.',
+            ]);
+
+            return [
+                'success'        => true,
+                'held'           => true,
+                'invoice_number' => $inv->invoice_number,
+                'status'         => 'flagged_eligibility_lapsed',
+                'message'        => 'Payment was successfully captured, but registration is held for administrative review due to membership standing.',
+            ];
+        }
 
         // 2. Mark Registration Confirmed
         $wpdb->update($t_reg, [

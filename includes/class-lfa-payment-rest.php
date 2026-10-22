@@ -97,6 +97,13 @@ final class LFA_Payment_REST {
             'callback'            => [__CLASS__, 'handle_get_receipt'],
             'permission_callback' => [__CLASS__, 'check_auth_permission'],
         ]);
+
+        // Issue or Retrieve Current Renewal Invoice for Expired/Renewing Member
+        register_rest_route(self::NAMESPACE, '/payments/renew-membership', [
+            'methods'             => 'POST',
+            'callback'            => [__CLASS__, 'handle_renew_membership'],
+            'permission_callback' => [__CLASS__, 'check_auth_permission'],
+        ]);
     }
 
     public static function check_auth_permission(WP_REST_Request $request): bool {
@@ -422,5 +429,43 @@ HTML : '';
 </body>
 </html>
 HTML;
+    }
+
+    /**
+     * Member Membership Renewal Handler
+     * Confirmed Policy (Phase 05):
+     * Generates or retrieves a single $100 annual dues invoice for the renewal period.
+     */
+    public static function handle_renew_membership(WP_REST_Request $request): WP_REST_Response {
+        $user_id = get_current_user_id();
+        if ($user_id <= 0) {
+            return new WP_REST_Response(['success' => false, 'error' => 'Authentication required.'], 401);
+        }
+
+        if (!LFA_Core::is_approved($user_id)) {
+            return new WP_REST_Response([
+                'success' => false,
+                'error'   => 'Account must be approved by an administrator before renewing membership.',
+            ], 403);
+        }
+
+        $inv = LFA_Membership::renew_membership($user_id, $user_id);
+        if (!$inv) {
+            return new WP_REST_Response([
+                'success' => false,
+                'error'   => 'Unable to generate renewal invoice. Please contact support.',
+            ], 500);
+        }
+
+        return new WP_REST_Response([
+            'success'        => true,
+            'invoice_id'     => (int) $inv->id,
+            'invoice_number' => $inv->invoice_number,
+            'amount_cents'   => (int) $inv->amount_cents,
+            'amount_dollars' => number_format($inv->amount_cents / 100, 2),
+            'currency'       => $inv->currency,
+            'status'         => $inv->status,
+            'message'        => 'Annual membership dues renewal invoice generated successfully ($100.00 USD).',
+        ], 200);
     }
 }

@@ -77,14 +77,49 @@ final class LFA_Conference_REST {
         return is_user_logged_in();
     }
 
-    public static function check_register_permission(WP_REST_Request $request): bool {
-        // Logged-in users can register; guests only if guest registration is enabled
-        if (is_user_logged_in()) {
+    public static function check_register_permission(WP_REST_Request $request) {
+        if (!is_user_logged_in()) {
+            return new WP_Error(
+                'rest_forbidden',
+                __('Conference registration is available exclusively to active Love Family Alumni members.', 'love-family-core'),
+                ['status' => 401]
+            );
+        }
+
+        $user_id = get_current_user_id();
+
+        // Administrator / Staff bypass
+        if (user_can($user_id, 'manage_options') || user_can($user_id, 'edit_users')) {
             return true;
         }
-        $conf_id = (int)$request->get_param('conference_id');
-        $conf = $conf_id > 0 ? LFA_Conference::get_conference_by_id($conf_id) : LFA_Conference::get_conference();
-        return $conf && (int)$conf->guest_registration_enabled === 1;
+
+        if (class_exists('LFA_Payment_Entitlements')) {
+            if (!LFA_Payment_Entitlements::is_account_approved($user_id)) {
+                return new WP_Error(
+                    'account_not_approved',
+                    __('Your alumni membership account must be verified and administrator-approved before registering for the conference.', 'love-family-core'),
+                    ['status' => 403]
+                );
+            }
+
+            if (!LFA_Payment_Entitlements::is_full_member($user_id, true)) {
+                $standing = LFA_Payment_Entitlements::get_dues_standing($user_id, true);
+                if (($standing['standing'] ?? '') === 'expired') {
+                    return new WP_Error(
+                        'membership_expired',
+                        __('Your annual membership has expired. Renew your membership to register for the conference.', 'love-family-core'),
+                        ['status' => 403]
+                    );
+                }
+                return new WP_Error(
+                    'membership_unpaid',
+                    __('You must complete your $100 annual membership dues before registering for this conference.', 'love-family-core'),
+                    ['status' => 403]
+                );
+            }
+        }
+
+        return true;
     }
 
     /**
@@ -149,7 +184,8 @@ final class LFA_Conference_REST {
         $res = LFA_Conference::create_registration($params, $user_id);
         if (!$res['success']) {
             $code = $res['code'] ?? 'REGISTRATION_FAILED';
-            $status = ($code === 'ACCOUNT_NOT_APPROVED' || $code === 'GUEST_REGISTRATION_DISABLED') ? 403 : 400;
+            $forbidden_codes = ['ACCOUNT_NOT_APPROVED', 'GUEST_REGISTRATION_DISABLED', 'MEMBERSHIP_REQUIRED', 'MEMBERSHIP_UNPAID', 'MEMBERSHIP_EXPIRED', 'MEMBERSHIP_DUES_REQUIRED'];
+            $status = in_array($code, $forbidden_codes, true) ? 403 : 400;
             return new WP_REST_Response([
                 'success' => false,
                 'code'    => $code,

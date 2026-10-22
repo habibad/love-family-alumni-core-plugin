@@ -221,27 +221,14 @@ final class LFA_Admin {
 
                 <table class="form-table" role="presentation">
                     <tr>
-                        <th scope="row"><label for="individual_base_dollars">Individual Annual Dues *</label></th>
+                        <th scope="row"><label for="individual_base_dollars">Annual Membership Dues *</label></th>
                         <td>
                             <div style="display:flex;align-items:center;gap:6px;">
                                 <span>$</span>
                                 <input type="number" id="individual_base_dollars" name="individual_base_dollars" step="1" min="1" value="<?php echo esc_attr((int)($policy['individual_base_cents'] / 100)); ?>" required class="regular-text" style="width:120px;">
-                                <span>USD (Documented base fee: $100.00 / 10,000 cents)</span>
+                                <span>USD (Confirmed single package rate: $100.00 / 10,000 cents)</span>
                             </div>
-                            <p class="description">Authoritative annual membership base fee specified in client brief.</p>
-                        </td>
-                    </tr>
-                    <tr>
-                        <th scope="row"><label for="couple_base_dollars">Couple Membership Dues</label></th>
-                        <td>
-                            <div style="display:flex;align-items:center;gap:6px;">
-                                <span>$</span>
-                                <input type="number" id="couple_base_dollars" name="couple_base_dollars" step="1" min="0" value="<?php echo !empty($policy['couple_base_cents']) ? esc_attr((int)($policy['couple_base_cents'] / 100)) : ''; ?>" placeholder="Unconfigured" class="regular-text" style="width:120px;">
-                                <span>USD</span>
-                            </div>
-                            <div style="margin-top:8px;padding:8px 12px;background:#fff8e5;border-left:4px solid #dba617;font-size:12px;">
-                                <strong>Client Policy Pending:</strong> Leave blank to keep couple dues unconfigured. In accordance with policy contract, couple invoices cannot be issued without an approved fee.
-                            </div>
+                            <p class="description">Authoritative annual membership dues rate. Love Family Alumni offers only one unified membership package at $100 USD/year (valid for exactly one calendar year).</p>
                         </td>
                     </tr>
                     <tr>
@@ -419,13 +406,12 @@ final class LFA_Admin {
         check_admin_referer('lfa_save_dues_policy_action', 'lfa_policy_nonce');
 
         $indiv_dollars = isset($_POST['individual_base_dollars']) ? absint($_POST['individual_base_dollars']) : 100;
-        $couple_dollars = !empty($_POST['couple_base_dollars']) ? absint($_POST['couple_base_dollars']) : null;
-        $cycle = isset($_POST['billing_cycle']) ? sanitize_key($_POST['billing_cycle']) : 'unconfigured';
+        $cycle = isset($_POST['billing_cycle']) ? sanitize_key($_POST['billing_cycle']) : 'calendar';
         $grace = !empty($_POST['grace_period_days']) ? absint($_POST['grace_period_days']) : null;
 
         $new_policy = [
             'individual_base_cents' => $indiv_dollars * 100,
-            'couple_base_cents'     => $couple_dollars ? ($couple_dollars * 100) : null,
+            'couple_base_cents'     => null, // Couple membership permanently removed
             'billing_cycle'         => $cycle,
             'grace_period_days'     => $grace,
         ];

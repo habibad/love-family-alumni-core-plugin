@@ -167,13 +167,12 @@ final class LFA_Payment_Reconciliation {
         $t_cap = LFA_Payment_Service::table_captures();
         $now = current_time('mysql', true);
 
-        $client = LFA_Stripe_Gateway::get_client();
-        if (!$client) {
-            return ['success' => false, 'error' => 'Stripe client unavailable for settlement.'];
-        }
-
         // If session object was not provided, retrieve it from Stripe
         if (!$session) {
+            $client = LFA_Stripe_Gateway::get_client();
+            if (!$client) {
+                return ['success' => false, 'error' => 'Stripe client unavailable for settlement.'];
+            }
             try {
                 $session = $client->checkout->sessions->retrieve($session_id, ['expand' => ['payment_intent']]);
             } catch (\Exception $e) {
@@ -375,14 +374,39 @@ final class LFA_Payment_Reconciliation {
                 'updated_at' => $now,
             ], ['user_id' => $inv->user_id]);
 
-            $one_year_later = date('Y-m-d H:i:s', strtotime('+1 year', strtotime($now)));
-            if (!empty($inv->period_id)) {
+            $one_year_later = LFA_Membership::calculate_calendar_year_expiry($now);
+            $period_id = (int)$inv->period_id;
+            if ($period_id <= 0) {
+                $mem_row = $wpdb->get_row($wpdb->prepare("SELECT id FROM {$t_mem} WHERE user_id = %d", $inv->user_id));
+                if ($mem_row) {
+                    $existing_per = $wpdb->get_row($wpdb->prepare("SELECT id FROM {$t_per} WHERE membership_id = %d ORDER BY id DESC LIMIT 1", $mem_row->id));
+                    if ($existing_per) {
+                        $period_id = (int)$existing_per->id;
+                    } else {
+                        $current_year = (int) gmdate('Y', strtotime($now));
+                        $period_key = $current_year . '/' . ($current_year + 1);
+                        $wpdb->insert($t_per, [
+                            'membership_id' => $mem_row->id,
+                            'period_key'    => $period_key,
+                            'standing'      => LFA_Membership::STANDING_CURRENT,
+                            'starts_at'     => $now,
+                            'ends_at'       => $one_year_later,
+                            'created_at'    => $now,
+                            'updated_at'    => $now,
+                        ]);
+                        $period_id = (int) $wpdb->insert_id;
+                    }
+                    $wpdb->update($t_inv, ['period_id' => $period_id], ['id' => $inv->id]);
+                }
+            }
+
+            if ($period_id > 0) {
                 $wpdb->update($t_per, [
                     'standing'   => LFA_Membership::STANDING_CURRENT,
                     'starts_at'  => $now,
                     'ends_at'    => $one_year_later,
                     'updated_at' => $now,
-                ], ['id' => (int)$inv->period_id]);
+                ], ['id' => $period_id]);
             }
 
             update_user_meta($inv->user_id, 'lfa_dues_status', 'current');

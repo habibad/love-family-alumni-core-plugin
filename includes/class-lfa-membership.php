@@ -39,6 +39,12 @@ final class LFA_Membership {
 
         // Register custom administrative capabilities
         add_action('init', [__CLASS__, 'register_capabilities']);
+
+        // Schedule daily expiration maintenance (secondary background health check)
+        if (!wp_next_scheduled('lfa_daily_membership_expiration_check')) {
+            wp_schedule_event(time(), 'daily', 'lfa_daily_membership_expiration_check');
+        }
+        add_action('lfa_daily_membership_expiration_check', [__CLASS__, 'check_all_expirations']);
     }
 
     public static function register_capabilities(): void {
@@ -223,16 +229,15 @@ final class LFA_Membership {
         $current = self::get_policy();
 
         $individual_cents = isset($new_policy['individual_base_cents']) ? absint($new_policy['individual_base_cents']) : 10000;
-        $couple_cents = !empty($new_policy['couple_base_cents']) ? absint($new_policy['couple_base_cents']) : null;
-        $cycle = in_array($new_policy['billing_cycle'] ?? '', ['calendar', 'anniversary'], true) ? $new_policy['billing_cycle'] : 'unconfigured';
+        $cycle = in_array($new_policy['billing_cycle'] ?? '', ['calendar', 'anniversary'], true) ? $new_policy['billing_cycle'] : 'calendar';
         $grace = !empty($new_policy['grace_period_days']) ? absint($new_policy['grace_period_days']) : null;
 
-        $version_num = (float) filter_var($current['policy_version'], FILTER_SANITIZE_NUMBER_FLOAT, FILTER_FLAG_ALLOW_FRACTION);
-        $new_version = 'v' . number_format($version_num > 0 ? $version_num + 0.1 : 1.1, 1);
+        $version_num = (float) filter_var($current['policy_version'] ?? '1.0', FILTER_SANITIZE_NUMBER_FLOAT, FILTER_FLAG_ALLOW_FRACTION);
+        $new_version = 'v' . number_format($version_num > 0 ? $version_num + 0.1 : 2.1, 1);
 
         $policy = [
             'individual_base_cents' => $individual_cents,
-            'couple_base_cents'     => $couple_cents,
+            'couple_base_cents'     => null, // Deprecated: single $100 annual membership policy
             'billing_cycle'         => $cycle,
             'grace_period_days'     => $grace,
             'auto_recurring'        => false, // Strictly false in Phase 03
@@ -246,7 +251,6 @@ final class LFA_Membership {
         self::log_audit($actor_id, 0, 'policy_updated', 'policy', 0, [
             'version'          => $new_version,
             'individual_cents' => $individual_cents,
-            'couple_cents'     => $couple_cents,
             'cycle'            => $cycle,
         ]);
 
@@ -388,17 +392,7 @@ final class LFA_Membership {
         }
 
         $policy = self::get_policy();
-        $amount_cents = $policy['individual_base_cents'];
-
-        if ($membership->membership_type === 'couple') {
-            if (empty($policy['couple_base_cents']) || $policy['couple_base_cents'] <= 0) {
-                return [
-                    'success' => false,
-                    'error'   => 'Couple Membership annual dues price is unconfigured. Awaiting administrator policy confirmation before invoicing.',
-                ];
-            }
-            $amount_cents = (int) $policy['couple_base_cents'];
-        }
+        $amount_cents = (int) ($policy['individual_base_cents'] ?? 10000);
 
         // Check for existing period
         $t_periods = self::table_periods();
@@ -580,6 +574,17 @@ final class LFA_Membership {
      */
     public static function renew_membership(int $user_id, int $actor_id = 0): ?object {
         global $wpdb;
+        $t_inv = self::table_invoices();
+
+        // 1. Prevent duplicate payable invoices for the same renewal period
+        $existing_unpaid = $wpdb->get_row($wpdb->prepare(
+            "SELECT * FROM {$t_inv} WHERE user_id = %d AND status = %s ORDER BY id DESC LIMIT 1",
+            $user_id, self::INVOICE_STATUS_UNPAID
+        ));
+        if ($existing_unpaid) {
+            return $existing_unpaid;
+        }
+
         $mem = self::get_or_create_membership($user_id);
         $policy = self::get_policy();
         $now = current_time('mysql', true);
@@ -629,6 +634,166 @@ final class LFA_Membership {
             'period_key' => $period_key,
         ]);
 
+        if ($inv) {
+            $user = get_user_by('id', $user_id);
+            if ($user && is_email($user->user_email)) {
+                $subject = 'Love Family Alumni — Annual Membership Renewal Invoice #' . $inv->invoice_number;
+                $message = "Dear " . ($user->display_name ?: 'Alumni Member') . ",\n\n"
+                    . "Your annual Love Family Alumni membership renewal invoice (#" . $inv->invoice_number . ") for $100.00 USD has been issued.\n\n"
+                    . "Please sign in to your Member Dashboard to complete your annual dues payment and maintain active member access:\n"
+                    . home_url('/member-dashboard/#dues') . "\n\n"
+                    . "Warm regards,\nLove Family Alumni (North America Zone)";
+                wp_mail($user->user_email, $subject, $message);
+            }
+        }
+
         return $inv;
+    }
+
+    /**
+     * Authoritative One-Year Calendar Lifecycle Expiry Calculation
+     *
+     * Calculates the exact expiration timestamp for a one-year membership.
+     * Starts strictly at the payment activation timestamp (UTC).
+     * Correctly defines and handles leap-year edge cases (e.g. Feb 29).
+     *
+     * @param string $starts_at_utc Date string in 'Y-m-d H:i:s' UTC
+     * @return string Expiration date in 'Y-m-d H:i:s' UTC
+     */
+    public static function calculate_calendar_year_expiry(string $starts_at_utc): string {
+        $dt = DateTimeImmutable::createFromFormat('Y-m-d H:i:s', $starts_at_utc, new DateTimeZone('UTC'));
+        if (!$dt) {
+            $dt = new DateTimeImmutable($starts_at_utc, new DateTimeZone('UTC'));
+        }
+
+        $year  = (int) $dt->format('Y');
+        $month = (int) $dt->format('m');
+        $day   = (int) $dt->format('d');
+        $time  = $dt->format('H:i:s');
+
+        $next_year = $year + 1;
+
+        // Leap year handling: if payment occurred on Feb 29 and next year is non-leap,
+        // expire on Feb 28 of the following year at the exact same time.
+        if ($month === 2 && $day === 29) {
+            $is_next_leap = ( ($next_year % 4 === 0) && ($next_year % 100 !== 0) ) || ($next_year % 400 === 0);
+            if (!$is_next_leap) {
+                return sprintf('%04d-02-28 %s', $next_year, $time);
+            }
+        }
+
+        return sprintf('%04d-%02d-%02d %s', $next_year, $month, $day, $time);
+    }
+
+    /**
+     * Server-Authoritative Real-Time Expiration Evaluation & State Sync
+     *
+     * Evaluates membership entitlement on every relevant protected request.
+     * Never relies exclusively on WP-Cron.
+     * When current time reaches ends_at:
+     * - Paid entitlement becomes inactive
+     * - Membership status in DB transitions to expired
+     * - User meta and periods are updated and audited
+     *
+     * Supports optional $reference_time_utc for isolated time-boundary testing (Test E).
+     */
+    public static function evaluate_and_sync_expiration(int $user_id, ?string $reference_time_utc = null): array {
+        if ($user_id <= 0) {
+            return ['status' => 'guest', 'expired' => false];
+        }
+
+        global $wpdb;
+        $t_mem = self::table_memberships();
+        $t_per = self::table_periods();
+        $now_utc = $reference_time_utc ?: current_time('mysql', true);
+
+        $mem = self::get_membership_by_user($user_id);
+        if (!$mem) {
+            return ['status' => 'unpaid', 'expired' => false];
+        }
+
+        $period = $wpdb->get_row($wpdb->prepare(
+            "SELECT * FROM {$t_per} WHERE membership_id = %d ORDER BY id DESC LIMIT 1",
+            $mem->id
+        ));
+
+        if (!$period) {
+            return ['status' => $mem->status, 'expired' => false];
+        }
+
+        // If period already marked expired
+        if ($period->standing === self::STANDING_EXPIRED || $mem->status === self::STANDING_EXPIRED) {
+            return [
+                'status'     => self::STANDING_EXPIRED,
+                'expired'    => true,
+                'starts_at'  => $period->starts_at,
+                'ends_at'    => $period->ends_at,
+                'period_id'  => (int)$period->id,
+            ];
+        }
+
+        // Check if ends_at exists and has lapsed
+        if (!empty($period->ends_at) && $period->ends_at <= $now_utc) {
+            // Instant Expiration: Update period and membership in database
+            $wpdb->update($t_per, [
+                'standing'   => self::STANDING_EXPIRED,
+                'updated_at' => current_time('mysql', true),
+            ], ['id' => $period->id]);
+
+            $wpdb->update($t_mem, [
+                'status'     => self::STANDING_EXPIRED,
+                'updated_at' => current_time('mysql', true),
+            ], ['id' => $mem->id]);
+
+            update_user_meta($user_id, 'lfa_dues_status', self::STANDING_EXPIRED);
+
+            self::log_audit(0, $user_id, 'membership_expired_authoritative', 'membership', $mem->id, [
+                'expired_at'       => $period->ends_at,
+                'evaluated_at_utc' => $now_utc,
+                'previous_status'  => $mem->status,
+            ]);
+
+            return [
+                'status'     => self::STANDING_EXPIRED,
+                'expired'    => true,
+                'starts_at'  => $period->starts_at,
+                'ends_at'    => $period->ends_at,
+                'period_id'  => (int)$period->id,
+            ];
+        }
+
+        return [
+            'status'     => $period->standing,
+            'expired'    => false,
+            'starts_at'  => $period->starts_at,
+            'ends_at'    => $period->ends_at,
+            'period_id'  => (int)$period->id,
+        ];
+    }
+
+    /**
+     * Daily Background Expiration Maintenance (WP-Cron health check)
+     */
+    public static function check_all_expirations(): int {
+        global $wpdb;
+        $t_per = self::table_periods();
+        $t_mem = self::table_memberships();
+        $now = current_time('mysql', true);
+
+        $expired_periods = $wpdb->get_results($wpdb->prepare(
+            "SELECT p.id, p.membership_id, m.user_id FROM {$t_per} p
+             INNER JOIN {$t_mem} m ON p.membership_id = m.id
+             WHERE p.standing = %s AND p.ends_at IS NOT NULL AND p.ends_at <= %s",
+            self::STANDING_CURRENT,
+            $now
+        ));
+
+        $count = 0;
+        foreach ($expired_periods as $ep) {
+            self::evaluate_and_sync_expiration((int)$ep->user_id);
+            $count++;
+        }
+
+        return $count;
     }
 }

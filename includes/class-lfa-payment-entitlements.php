@@ -68,10 +68,18 @@ final class LFA_Payment_Entitlements {
                 'is_test_paid'     => false,
                 'gateway_provider' => null,
                 'paid_at'          => null,
+                'starts_at'        => null,
+                'ends_at'          => null,
+                'expires_at'       => null,
                 'invoice_number'   => null,
                 'policy_version'   => null,
                 'environment'      => null,
             ];
+        }
+
+        // Real-time authoritative expiration sync (independent of WP-Cron)
+        if (class_exists('LFA_Membership')) {
+            LFA_Membership::evaluate_and_sync_expiration($user_id);
         }
 
         global $wpdb;
@@ -81,8 +89,20 @@ final class LFA_Payment_Entitlements {
         $t_per = LFA_Membership::table_periods();
         $now   = current_time('mysql', true);
 
-        // Check if membership is explicitly expired or period has ended
+        // Fetch membership and latest period
         $membership = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$t_mem} WHERE user_id = %d", $user_id));
+        $period = null;
+        if ($membership) {
+            $period = $wpdb->get_row($wpdb->prepare(
+                "SELECT * FROM {$t_per} WHERE membership_id = %d ORDER BY id DESC LIMIT 1",
+                $membership->id
+            ));
+        }
+
+        $starts_at = $period->starts_at ?? null;
+        $ends_at   = $period->ends_at ?? null;
+
+        // Check if membership is explicitly expired or period has ended
         if ($membership && $membership->status === LFA_Membership::STANDING_EXPIRED) {
             return [
                 'standing'         => 'expired',
@@ -91,33 +111,34 @@ final class LFA_Payment_Entitlements {
                 'is_live_paid'     => false,
                 'gateway_provider' => null,
                 'paid_at'          => null,
+                'starts_at'        => $starts_at,
+                'ends_at'          => $ends_at,
+                'expires_at'       => $ends_at,
                 'invoice_id'       => null,
                 'invoice_number'   => null,
                 'policy_version'   => $membership->policy_version ?? null,
                 'environment'      => null,
+                'expired_at'       => $ends_at,
             ];
         }
 
-        if ($membership) {
-            $period = $wpdb->get_row($wpdb->prepare(
-                "SELECT * FROM {$t_per} WHERE membership_id = %d ORDER BY id DESC LIMIT 1",
-                $membership->id
-            ));
-            if ($period && ($period->standing === LFA_Membership::STANDING_EXPIRED || (!empty($period->ends_at) && $period->ends_at < $now))) {
-                return [
-                    'standing'         => 'expired',
-                    'is_paid'          => false,
-                    'is_test_paid'     => false,
-                    'is_live_paid'     => false,
-                    'gateway_provider' => null,
-                    'paid_at'          => null,
-                    'invoice_id'       => null,
-                    'invoice_number'   => null,
-                    'policy_version'   => null,
-                    'environment'      => null,
-                    'expired_at'       => $period->ends_at,
-                ];
-            }
+        if ($period && ($period->standing === LFA_Membership::STANDING_EXPIRED || (!empty($period->ends_at) && $period->ends_at < $now))) {
+            return [
+                'standing'         => 'expired',
+                'is_paid'          => false,
+                'is_test_paid'     => false,
+                'is_live_paid'     => false,
+                'gateway_provider' => null,
+                'paid_at'          => null,
+                'starts_at'        => $starts_at,
+                'ends_at'          => $ends_at,
+                'expires_at'       => $ends_at,
+                'invoice_id'       => null,
+                'invoice_number'   => null,
+                'policy_version'   => null,
+                'environment'      => null,
+                'expired_at'       => $ends_at,
+            ];
         }
 
         // Query most recent invoice
@@ -202,6 +223,9 @@ final class LFA_Payment_Entitlements {
             'gateway_provider' => $gateway_provider,
             'environment'      => $environment,
             'paid_at'          => $capture ? $capture->captured_at : $inv->paid_at,
+            'starts_at'        => $starts_at,
+            'ends_at'          => $ends_at,
+            'expires_at'       => $ends_at,
             'invoice_id'       => (int) $inv->id,
             'invoice_number'   => $inv->invoice_number,
             'policy_version'   => $inv->policy_version,
@@ -233,6 +257,124 @@ final class LFA_Payment_Entitlements {
         // 2. Must have verified paid dues for the current period
         $dues = self::get_dues_standing($user_id, $allow_staging_test);
         return !empty($dues['is_paid']) && $dues['standing'] === 'current';
+    }
+
+    /**
+     * Confirmed Conference Registration Eligibility Policy:
+     * Only registered, administrator-approved, currently paid members can register for a conference.
+     * Guest Conference Registration is not allowed.
+     * Approved but unpaid members cannot register.
+     * Expired members cannot register until they renew their annual membership.
+     * Pending or rejected members cannot register.
+     */
+    public static function can_register_conference(int $user_id): bool {
+        if ($user_id <= 0) {
+            return false;
+        }
+        return self::is_full_member($user_id, true);
+    }
+
+    /**
+     * Get authoritative Conference Eligibility State for a given user.
+     * Returns the exact 4 prompt-specified UI states and actions:
+     * - 'guest': Unauthenticated visitor
+     * - 'pending_approval': Authenticated, awaiting admin approval
+     * - 'approved_unpaid': Approved alumnus, dues unpaid
+     * - 'expired': Approved alumnus, dues expired
+     * - 'active_paid': Approved alumnus with active paid dues (Eligible to register)
+     * - 'admin_staff': Administrator/Staff bypass
+     */
+    public static function get_conference_eligibility_state(int $user_id = 0): array {
+        if ($user_id <= 0) {
+            $user_id = get_current_user_id();
+        }
+
+        if ($user_id <= 0) {
+            return [
+                'state'       => 'guest',
+                'eligible'    => false,
+                'title'       => 'Membership Required',
+                'message'     => 'Conference registration is available exclusively to active Love Family Alumni members.',
+                'primary_cta' => [
+                    'label' => 'Member Login',
+                    'url'   => wp_login_url(get_permalink()),
+                ],
+                'secondary_cta' => [
+                    'label' => 'Become a Member',
+                    'url'   => home_url('/membership/'),
+                ],
+            ];
+        }
+
+        if (user_can($user_id, 'manage_options') || user_can($user_id, 'edit_users')) {
+            return [
+                'state'       => 'admin_staff',
+                'eligible'    => true,
+                'title'       => 'Administrative Access',
+                'message'     => 'Authorized administrator / staff registration.',
+                'primary_cta' => null,
+                'secondary_cta' => null,
+            ];
+        }
+
+        if (!self::is_account_approved($user_id)) {
+            return [
+                'state'       => 'pending_approval',
+                'eligible'    => false,
+                'title'       => 'Account Approval Pending',
+                'message'     => 'Your alumni account is pending administrator approval. Conference registration opens once approved and annual dues are activated.',
+                'primary_cta' => [
+                    'label' => 'My Dashboard',
+                    'url'   => home_url('/member-dashboard/'),
+                ],
+                'secondary_cta' => null,
+            ];
+        }
+
+        $dues = self::get_dues_standing($user_id, true);
+
+        if ($dues['standing'] === 'expired') {
+            return [
+                'state'       => 'expired',
+                'eligible'    => false,
+                'title'       => 'Renew Membership to Register',
+                'message'     => 'Your annual Love Family Alumni membership has expired. Renew your $100 annual dues to restore access and register for this conference.',
+                'primary_cta' => [
+                    'label' => 'Renew Membership',
+                    'url'   => home_url('/member-dashboard/#membership-renewal'),
+                ],
+                'secondary_cta' => [
+                    'label' => 'My Dashboard',
+                    'url'   => home_url('/member-dashboard/'),
+                ],
+            ];
+        }
+
+        if (empty($dues['is_paid']) || $dues['standing'] !== 'current') {
+            return [
+                'state'       => 'approved_unpaid',
+                'eligible'    => false,
+                'title'       => 'Activate Your Membership First',
+                'message'     => 'You must complete your $100 annual membership dues before registering for this conference.',
+                'primary_cta' => [
+                    'label' => 'Pay Annual Dues',
+                    'url'   => home_url('/member-dashboard/#annual-dues'),
+                ],
+                'secondary_cta' => [
+                    'label' => 'My Dashboard',
+                    'url'   => home_url('/member-dashboard/'),
+                ],
+            ];
+        }
+
+        return [
+            'state'         => 'active_paid',
+            'eligible'      => true,
+            'title'         => 'Active Paid Member',
+            'message'       => 'You are eligible to register for this conference.',
+            'primary_cta'   => null,
+            'secondary_cta' => null,
+        ];
     }
 
     /**
@@ -460,8 +602,11 @@ final class LFA_Payment_Entitlements {
             'conference_registered'  => !empty($conf_regs),
             'conference_records'     => $conf_regs,
             'can_access_directory'   => self::can_access_directory($user_id),
+            'can_register_conference'=> self::can_register_conference($user_id),
             'can_register_business'  => self::can_register_business($user_id),
             'can_apply_scholarship'  => self::can_apply_scholarship($user_id),
+            'starts_at'              => $dues_info['starts_at'] ?? null,
+            'ends_at'                => $dues_info['ends_at'] ?? null,
             'diagnosed_at'           => current_time('mysql', true),
         ];
     }
