@@ -1,0 +1,13 @@
+{
+    "name": "love-family/love-family-core",
+    "description": "Love Family Alumni Core Plugin",
+    "type": "wordpress-plugin",
+    "require": {
+        "php": ">=8.1",
+        "stripe/stripe-php": "16.4.0"
+    },
+    "config": {
+        "preferred-install": "dist",
+        "sort-packages": true
+    }
+}
