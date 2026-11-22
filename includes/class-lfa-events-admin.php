@@ -103,6 +103,7 @@ final class LFA_Events_Admin {
                 <thead>
                     <tr>
                         <th style="width: 40px;">ID</th>
+                        <th style="width: 65px;">Image</th>
                         <th>Event Title / Slug</th>
                         <th>Category</th>
                         <th>Event Schedule & Timezone</th>
@@ -114,12 +115,21 @@ final class LFA_Events_Admin {
                 </thead>
                 <tbody>
                     <?php if (empty($events)): ?>
-                        <tr><td colspan="8">No events found in this view.</td></tr>
+                        <tr><td colspan="9">No events found in this view.</td></tr>
                     <?php else: foreach ($events as $p):
                         $event_data = LFA_Events::format_event_item($p);
+                        $t_id = get_post_thumbnail_id($p->ID);
+                        $t_src = $t_id ? wp_get_attachment_image_url($t_id, 'thumbnail') : '';
                         ?>
                         <tr>
                             <td>#<?php echo esc_html($p->ID); ?></td>
+                            <td>
+                                <?php if ($t_src): ?>
+                                    <img src="<?php echo esc_url($t_src); ?>" alt="" style="width:50px; height:38px; object-fit:cover; border-radius:4px; border:1px solid #ddd;">
+                                <?php else: ?>
+                                    <span style="display:inline-block; width:50px; height:38px; background:#f0f2f5; border-radius:4px; border:1px dashed #ccd0d4; text-align:center; line-height:38px; color:#999; font-size:10px;">No Img</span>
+                                <?php endif; ?>
+                            </td>
                             <td>
                                 <strong><a href="<?php echo esc_url(admin_url('admin.php?page=lfa-event-edit&event_id=' . $p->ID)); ?>"><?php echo esc_html($p->post_title); ?></a></strong><br>
                                 <code><?php echo esc_html($p->post_name); ?></code>
@@ -248,6 +258,10 @@ final class LFA_Events_Admin {
         // Format dates for HTML datetime-local inputs
         $start_input = $start_raw ? date('Y-m-d\TH:i', strtotime($start_raw)) : '';
         $end_input   = $end_raw ? date('Y-m-d\TH:i', strtotime($end_raw)) : '';
+
+        wp_enqueue_media();
+        $thumb_id  = $post ? get_post_thumbnail_id($post->ID) : 0;
+        $thumb_url = $thumb_id ? wp_get_attachment_image_url($thumb_id, 'medium_large') : '';
         ?>
         <div class="wrap">
             <h1><?php echo $post ? 'Edit Event: ' . esc_html($post->post_title) : 'Create New Event'; ?></h1>
@@ -296,6 +310,57 @@ final class LFA_Events_Admin {
                         ?>
                     </p>
                 </div>
+
+                <!-- Event Featured Image / Banner Uploader -->
+                <div class="card" style="padding: 20px; margin-bottom: 20px;">
+                    <h2>Event Featured Image / Banner</h2>
+                    <p class="description">Upload or select an event cover photo or banner from the WordPress media library to display on event cards and the event details page.</p>
+                    <div style="margin-top: 15px;">
+                        <input type="hidden" name="featured_image_id" id="lfa_event_image_id" value="<?php echo esc_attr($thumb_id); ?>">
+                        <div id="lfa_event_image_preview_wrap" style="margin-bottom: 15px; <?php echo empty($thumb_url) ? 'display:none;' : ''; ?>">
+                            <img id="lfa_event_image_preview" src="<?php echo esc_url($thumb_url); ?>" alt="Event Preview" style="max-width: 380px; max-height: 240px; border-radius: 8px; border: 1px solid #ccd0d4; display: block; object-fit: cover;">
+                        </div>
+                        <button type="button" class="button button-secondary button-large" id="lfa_event_upload_btn">
+                            <?php echo $thumb_url ? 'Change Event Image' : 'Select Event Image'; ?>
+                        </button>
+                        <button type="button" class="button button-link-delete" id="lfa_event_remove_btn" style="<?php echo empty($thumb_url) ? 'display:none;' : ''; ?> margin-left: 10px;">
+                            Remove Image
+                        </button>
+                    </div>
+                </div>
+
+                <script>
+                jQuery(document).ready(function($) {
+                    var mediaFrame;
+                    $('#lfa_event_upload_btn').on('click', function(e) {
+                        e.preventDefault();
+                        if (mediaFrame) { mediaFrame.open(); return; }
+                        mediaFrame = wp.media({
+                            title: 'Select or Upload Event Image',
+                            button: { text: 'Set Event Image' },
+                            multiple: false
+                        });
+                        mediaFrame.on('select', function() {
+                            var attachment = mediaFrame.state().get('selection').first().toJSON();
+                            $('#lfa_event_image_id').val(attachment.id);
+                            var url = (attachment.sizes && attachment.sizes.medium_large) ? attachment.sizes.medium_large.url : attachment.url;
+                            $('#lfa_event_image_preview').attr('src', url);
+                            $('#lfa_event_image_preview_wrap').show();
+                            $('#lfa_event_remove_btn').show();
+                            $('#lfa_event_upload_btn').text('Change Event Image');
+                        });
+                        mediaFrame.open();
+                    });
+                    $('#lfa_event_remove_btn').on('click', function(e) {
+                        e.preventDefault();
+                        $('#lfa_event_image_id').val('');
+                        $('#lfa_event_image_preview').attr('src', '');
+                        $('#lfa_event_image_preview_wrap').hide();
+                        $(this).hide();
+                        $('#lfa_event_upload_btn').text('Select Event Image');
+                    });
+                });
+                </script>
 
                 <div class="card" style="padding: 20px; margin-bottom: 20px;">
                     <h2>Date, Timing & Timezone (EVE-008, EVE-009, EVE-010)</h2>
@@ -492,6 +557,16 @@ final class LFA_Events_Admin {
             update_post_meta($event_id, '_lfa_event_online_approved', $online_appr);
             update_post_meta($event_id, '_lfa_event_linked_conf_id', $linked_conf);
             update_post_meta($event_id, '_lfa_event_status', $target_status);
+
+            // Handle Dynamic Event Featured Image
+            if (isset($_POST['featured_image_id'])) {
+                $evt_thumb_id = (int)$_POST['featured_image_id'];
+                if ($evt_thumb_id > 0) {
+                    set_post_thumbnail($event_id, $evt_thumb_id);
+                } else {
+                    delete_post_thumbnail($event_id);
+                }
+            }
 
             // Audit logging
             if (class_exists('LFA_Content_Audit')) {

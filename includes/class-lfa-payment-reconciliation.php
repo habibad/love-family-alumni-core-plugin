@@ -34,12 +34,25 @@ final class LFA_Payment_Reconciliation {
         $event_id = sanitize_text_field($event->id);
         $event_type = sanitize_text_field($event->type);
 
-        // 2. Strict Livemode Check: Reject any live event in test setup
-        if (!empty($event->livemode)) {
-            LFA_Payment_Service::log_audit('system', null, 'stripe_live_event_rejected', $event_id, [
+        // 2. Strict Livemode & Security Alignment Check
+        $is_live_event = !empty($event->livemode);
+        $configured_mode = LFA_Gateway_Settings::get_stripe_mode();
+        $global_live = LFA_Gateway_Settings::is_global_live_payments_enabled();
+
+        if ($is_live_event) {
+            if ($configured_mode !== 'live' || !$global_live) {
+                LFA_Payment_Service::log_audit('system', null, 'stripe_live_event_rejected', $event_id, [
+                    'event_type'      => $event_type,
+                    'configured_mode' => $configured_mode,
+                    'global_live'     => $global_live ? 1 : 0,
+                ]);
+                return ['status' => 400, 'error' => 'Live Stripe webhook rejected: Stripe is not active in live production mode or Global Live Payments switch is disabled.'];
+            }
+        } elseif ($configured_mode === 'live') {
+            LFA_Payment_Service::log_audit('system', null, 'stripe_test_event_rejected_in_live', $event_id, [
                 'event_type' => $event_type,
             ]);
-            return ['status' => 400, 'error' => 'Live Stripe webhook rejected: Development gateway operates in TEST MODE only.'];
+            return ['status' => 400, 'error' => 'Test Stripe webhook rejected: Gateway is configured in LIVE production mode.'];
         }
 
         // 3. Deduplication Check (Idempotency)
@@ -59,7 +72,7 @@ final class LFA_Payment_Reconciliation {
                 'paypal_event_id'        => $event_id,
                 'paypal_transmission_id' => $event_id,
                 'event_type'             => $event_type,
-                'mode'                   => 'test',
+                'mode'                   => $is_live_event ? 'live' : 'test',
                 'verified_at'            => $now,
                 'processed_at'           => null,
                 'processing_state'       => 'verified',
@@ -83,7 +96,7 @@ final class LFA_Payment_Reconciliation {
             'event_type'  => $event_type,
             'received_at' => $now,
             'status'      => 'verified',
-        ]);
+        ], $is_live_event ? 'live' : 'test');
 
         // 4. Dispatch Event Family
         $settled = false;
@@ -167,9 +180,11 @@ final class LFA_Payment_Reconciliation {
         $t_cap = LFA_Payment_Service::table_captures();
         $now = current_time('mysql', true);
 
+        // Retrieve Stripe client
+        $client = LFA_Stripe_Gateway::get_client();
+
         // If session object was not provided, retrieve it from Stripe
         if (!$session) {
-            $client = LFA_Stripe_Gateway::get_client();
             if (!$client) {
                 return ['success' => false, 'error' => 'Stripe client unavailable for settlement.'];
             }
@@ -189,7 +204,11 @@ final class LFA_Payment_Reconciliation {
         $pi_id = is_string($session->payment_intent) ? $session->payment_intent : ($session->payment_intent->id ?? '');
         if (!empty($pi_id)) {
             try {
-                $payment_intent = is_object($session->payment_intent) ? $session->payment_intent : $client->paymentIntents->retrieve($pi_id);
+                if (is_object($session->payment_intent)) {
+                    $payment_intent = $session->payment_intent;
+                } elseif ($client) {
+                    $payment_intent = $client->paymentIntents->retrieve($pi_id);
+                }
             } catch (\Exception $e) {
                 // If payment intent retrieve fails, continue with session details
             }
@@ -246,7 +265,13 @@ final class LFA_Payment_Reconciliation {
             ];
         }
 
-        // Insert Capture Record (Marked as Stripe Test)
+        $is_live = (!empty($session->livemode) || LFA_Gateway_Settings::get_stripe_mode() === 'live');
+        $active_mode = $is_live ? 'live' : 'test';
+        $test_tx = $is_live ? 0 : 1;
+        $entitlement_effect = $is_live ? 'paid' : 'test_paid';
+        $merchant_name = $is_live ? 'Stripe Production Account' : 'Stripe Test Account';
+
+        // Insert Capture Record
         $wpdb->insert($t_cap, [
             'attempt_id'        => $attempt ? (int) $attempt->id : 0,
             'invoice_id'        => $invoice_id,
@@ -254,8 +279,8 @@ final class LFA_Payment_Reconciliation {
             'payable_id'        => $invoice_id,
             'paypal_capture_id' => $pi_capture_id,
             'paypal_order_id'   => $session_id,
-            'merchant_identity' => 'Stripe Test Account',
-            'mode'              => 'test',
+            'merchant_identity' => $merchant_name,
+            'mode'              => $active_mode,
             'amount_cents'      => $captured_cents,
             'currency'          => $captured_currency,
             'capture_status'    => 'COMPLETED',
@@ -266,12 +291,15 @@ final class LFA_Payment_Reconciliation {
         ]);
         $capture_id = $wpdb->insert_id;
 
-        // Populate new schema columns if available
+        // Populate schema columns
         $wpdb->query($wpdb->prepare(
-            "UPDATE {$t_cap} SET gateway_provider = 'stripe', gateway_environment = 'test', checkout_session_id = %s, provider_payment_id = %s, test_transaction = 1, settled_at = %s, payment_status = 'COMPLETED', entitlement_effect = 'test_paid' WHERE id = %d",
+            "UPDATE {$t_cap} SET gateway_provider = 'stripe', gateway_environment = %s, checkout_session_id = %s, provider_payment_id = %s, test_transaction = %d, settled_at = %s, payment_status = 'COMPLETED', entitlement_effect = %s WHERE id = %d",
+            $active_mode,
             $session_id,
             $pi_id,
+            $test_tx,
             $now,
+            $entitlement_effect,
             $capture_id
         ));
 
@@ -283,30 +311,31 @@ final class LFA_Payment_Reconciliation {
             ], ['id' => $attempt->id]);
         }
 
-        // Record last verified test transaction in settings
+        // Record last verified transaction in settings
         LFA_Gateway_Settings::record_last_transaction('stripe', [
             'session_id'   => $session_id,
             'pi_id'        => $pi_id,
             'amount_cents' => $captured_cents,
             'payable_type' => $p_type,
             'settled_at'   => $now,
-        ]);
+        ], $active_mode);
 
         // Settle based on payable type
         if ($p_type === 'donation') {
             if (class_exists('LFA_Donation')) {
                 LFA_Donation::settle_donation($invoice_id, $pi_capture_id, $session_id, $captured_cents);
-                // Mark donation record as test_transaction and gateway_provider stripe
+                // Mark donation record with proper test_transaction and gateway_provider stripe
                 $t_don = LFA_Donation::table_donations();
                 $wpdb->query($wpdb->prepare(
-                    "UPDATE {$t_don} SET status = 'paid', gateway_provider = 'stripe', provider_payment_id = %s, test_transaction = 1, paid_at = COALESCE(paid_at, %s), updated_at = %s WHERE id = %d",
+                    "UPDATE {$t_don} SET status = 'paid', gateway_provider = 'stripe', provider_payment_id = %s, test_transaction = %d, paid_at = COALESCE(paid_at, %s), updated_at = %s WHERE id = %d",
                     $pi_id,
+                    $test_tx,
                     $now,
                     $now,
                     $invoice_id
                 ));
             }
-            self::send_test_receipt_email($invoice_id, $pi_capture_id, 'donation', $target_user_id);
+            self::send_receipt_email($invoice_id, $pi_capture_id, 'donation', $target_user_id, $is_live);
             return [
                 'success'        => true,
                 'reconciled'     => true,
@@ -315,28 +344,30 @@ final class LFA_Payment_Reconciliation {
                 'session_id'     => $session_id,
                 'amount_dollars' => number_format($captured_cents / 100, 2),
                 'status'         => 'COMPLETED',
-                'message'        => 'Stripe Test donation successfully reconciled.',
+                'message'        => $is_live ? 'Stripe donation successfully reconciled.' : 'Stripe Test donation successfully reconciled.',
             ];
         }
 
         if ($p_type === 'conference' || $p_type === 'conference_pass') {
             if (class_exists('LFA_Conference')) {
                 LFA_Conference::settle_registration($invoice_id, $pi_capture_id, $captured_cents);
-                // Mark conference invoice and registration as test_paid
+                // Mark conference invoice and registration
                 $t_cinv = LFA_Conference::table_invoices();
                 $t_creg = LFA_Conference::table_registrations();
                 $wpdb->query($wpdb->prepare(
-                    "UPDATE {$t_cinv} SET gateway_provider = 'stripe', provider_payment_id = %s, test_paid = 1 WHERE id = %d",
+                    "UPDATE {$t_cinv} SET gateway_provider = 'stripe', provider_payment_id = %s, test_paid = %d WHERE id = %d",
                     $pi_id,
+                    $test_tx,
                     $invoice_id
                 ));
                 $wpdb->query($wpdb->prepare(
-                    "UPDATE {$t_creg} SET gateway_provider = 'stripe', provider_payment_id = %s, test_paid = 1 WHERE id = (SELECT registration_id FROM {$t_cinv} WHERE id = %d)",
+                    "UPDATE {$t_creg} SET gateway_provider = 'stripe', provider_payment_id = %s, test_paid = %d WHERE id = (SELECT registration_id FROM {$t_cinv} WHERE id = %d)",
                     $pi_id,
+                    $test_tx,
                     $invoice_id
                 ));
             }
-            self::send_test_receipt_email($invoice_id, $pi_capture_id, 'conference', $target_user_id);
+            self::send_receipt_email($invoice_id, $pi_capture_id, 'conference', $target_user_id, $is_live);
             return [
                 'success'        => true,
                 'reconciled'     => true,
@@ -345,7 +376,7 @@ final class LFA_Payment_Reconciliation {
                 'session_id'     => $session_id,
                 'amount_dollars' => number_format($captured_cents / 100, 2),
                 'status'         => 'COMPLETED',
-                'message'        => 'Stripe Test conference registration confirmed and settled.',
+                'message'        => $is_live ? 'Stripe conference registration confirmed and settled.' : 'Stripe Test conference registration confirmed and settled.',
             ];
         }
 
@@ -362,10 +393,11 @@ final class LFA_Payment_Reconciliation {
                 'updated_at' => $now,
             ], ['id' => $inv->id]);
 
-            // Safe update test_paid / gateway_provider on invoice
+            // Update test_paid / gateway_provider on invoice
             $wpdb->query($wpdb->prepare(
-                "UPDATE {$t_inv} SET gateway_provider = 'stripe', provider_payment_id = %s, test_paid = 1 WHERE id = %d",
+                "UPDATE {$t_inv} SET gateway_provider = 'stripe', provider_payment_id = %s, test_paid = %d WHERE id = %d",
                 $pi_id,
+                $test_tx,
                 $inv->id
             ));
 
@@ -411,7 +443,7 @@ final class LFA_Payment_Reconciliation {
 
             update_user_meta($inv->user_id, 'lfa_dues_status', 'current');
 
-            self::send_test_receipt_email((int)$inv->id, $pi_capture_id, 'membership_due', (int)$inv->user_id);
+            self::send_receipt_email((int)$inv->id, $pi_capture_id, 'membership_due', (int)$inv->user_id, $is_live);
         }
 
         LFA_Payment_Service::log_audit('member', $target_user_id, 'stripe_payment_settled', (string)$invoice_id, [
@@ -419,7 +451,7 @@ final class LFA_Payment_Reconciliation {
             'payment_intent'   => $pi_id,
             'amount_cents'     => $captured_cents,
             'payable_type'     => $p_type,
-            'test_transaction' => 1,
+            'test_transaction' => $test_tx,
         ]);
 
         return [
@@ -430,7 +462,7 @@ final class LFA_Payment_Reconciliation {
             'session_id'     => $session_id,
             'amount_dollars' => number_format($captured_cents / 100, 2),
             'status'         => 'COMPLETED',
-            'message'        => 'Stripe Test payment verified and staging membership standing updated to Current.',
+            'message'        => $is_live ? 'Stripe payment verified and membership standing updated to Current.' : 'Stripe Test payment verified and staging membership standing updated to Current.',
         ];
     }
 
@@ -507,9 +539,9 @@ final class LFA_Payment_Reconciliation {
     }
 
     /**
-     * Dispatch clearly labeled TEST receipt email via wp_mail()
+     * Dispatch Receipt Email via wp_mail() with Live/Production vs Test Mode formatting
      */
-    public static function send_test_receipt_email(int $invoice_id, string $capture_id, string $payable_type, int $user_id): bool {
+    public static function send_receipt_email(int $invoice_id, string $capture_id, string $payable_type, int $user_id, bool $is_live = false): bool {
         $email = '';
         $recipient_name = 'Alumni Member';
         $amount_str = '$100.00 USD';
@@ -528,8 +560,15 @@ final class LFA_Payment_Reconciliation {
                     $ref_str = $don->donation_ref ?: $capture_id;
                 }
             }
-        } elseif ($payable_type === 'conference') {
+        } elseif ($payable_type === 'conference' || $payable_type === 'conference_pass') {
             $type_label = '2027 Conference Pass Registration';
+            if (class_exists('LFA_Conference')) {
+                $cinv = LFA_Conference::get_invoice($invoice_id);
+                if ($cinv) {
+                    $amount_str = '$' . number_format($cinv->amount_cents / 100, 2) . ' USD';
+                    $ref_str = $cinv->invoice_number ?: $capture_id;
+                }
+            }
         }
 
         if (empty($email) && $user_id > 0) {
@@ -544,23 +583,55 @@ final class LFA_Payment_Reconciliation {
             return false;
         }
 
-        $subject = "[TEST MODE] Payment Receipt & Confirmation — {$type_label} (#{$ref_str})";
+        if ($is_live) {
+            $subject = "Official Payment Receipt & Confirmation — {$type_label} (#{$ref_str})";
 
-        $message = "NOTICE: THIS IS A VERIFIED STRIPE TEST MODE TRANSACTION — NO REAL MONEY CHARGED.\n\n"
-            . "Dear " . esc_html($recipient_name) . ",\n\n"
-            . "Your test payment for {$type_label} has been successfully verified via Stripe Test Mode.\n\n"
-            . "TRANSACTION SUMMARY (TEST ENVIRONMENT):\n"
-            . "------------------------------------------------------------\n"
-            . "Gateway Provider:  Stripe (Test Mode)\n"
-            . "Payment Reference: " . esc_html($capture_id) . "\n"
-            . "Item Reference:    #" . esc_html((string)$invoice_id) . " (" . esc_html($ref_str) . ")\n"
-            . "Amount Paid:       " . esc_html($amount_str) . "\n"
-            . "Environment:       TEST MODE (No real currency charged)\n"
-            . "Date of Payment:   " . current_time('mysql') . "\n"
-            . "------------------------------------------------------------\n\n"
-            . "Love Family Alumni Testing & Development Team\n";
+            $message = "Dear " . esc_html($recipient_name) . ",\n\n"
+                . "Thank you for your payment to Love Family Alumni — North America Zone.\n"
+                . "Your transaction for {$type_label} has been received and verified successfully.\n\n"
+                . "OFFICIAL PAYMENT RECEIPT:\n"
+                . "------------------------------------------------------------\n"
+                . "Gateway Provider:  Stripe (Verified Transaction)\n"
+                . "Payment Reference: " . esc_html($capture_id) . "\n"
+                . "Item Reference:    #" . esc_html((string)$invoice_id) . " (" . esc_html($ref_str) . ")\n"
+                . "Amount Paid:       " . esc_html($amount_str) . "\n"
+                . "Payment Status:    PAID & VERIFIED (Official Receipt)\n"
+                . "Date of Payment:   " . current_time('mysql') . "\n"
+                . "------------------------------------------------------------\n\n"
+                . "ACCOUNT STANDING & ENTITLEMENTS:\n"
+                . "Your alumni standing has been updated in our authoritative registry.\n"
+                . "You can view and print your complete official payment history anytime from your Member Dashboard:\n"
+                . home_url('/member-dashboard/#overview') . "\n\n"
+                . "If you have any questions or require assistance, please contact the secretariat at lovefamilyalumni.na@gmail.com.\n\n"
+                . "Warm regards,\n"
+                . "The Executive Council & Treasury Desk\n"
+                . "Love Family Alumni — North America Zone\n";
+        } else {
+            $subject = "[TEST MODE] Payment Receipt & Confirmation — {$type_label} (#{$ref_str})";
+
+            $message = "NOTICE: THIS IS A VERIFIED STRIPE TEST MODE TRANSACTION — NO REAL MONEY CHARGED.\n\n"
+                . "Dear " . esc_html($recipient_name) . ",\n\n"
+                . "Your test payment for {$type_label} has been successfully verified via Stripe Test Mode.\n\n"
+                . "TRANSACTION SUMMARY (TEST ENVIRONMENT):\n"
+                . "------------------------------------------------------------\n"
+                . "Gateway Provider:  Stripe (Test Mode)\n"
+                . "Payment Reference: " . esc_html($capture_id) . "\n"
+                . "Item Reference:    #" . esc_html((string)$invoice_id) . " (" . esc_html($ref_str) . ")\n"
+                . "Amount Paid:       " . esc_html($amount_str) . "\n"
+                . "Environment:       TEST MODE (No real currency charged)\n"
+                . "Date of Payment:   " . current_time('mysql') . "\n"
+                . "------------------------------------------------------------\n\n"
+                . "Love Family Alumni Testing & Development Team\n";
+        }
 
         $headers = ['Content-Type: text/plain; charset=UTF-8'];
         return wp_mail($email, $subject, $message, $headers);
+    }
+
+    /**
+     * Backward-compatible alias for test mode callers
+     */
+    public static function send_test_receipt_email(int $invoice_id, string $capture_id, string $payable_type, int $user_id): bool {
+        return self::send_receipt_email($invoice_id, $capture_id, $payable_type, $user_id, false);
     }
 }

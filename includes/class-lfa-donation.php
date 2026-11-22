@@ -777,8 +777,8 @@ final class LFA_Donation {
         $body .= "Receipt Reference: " . $donation->donation_ref . "\n";
         $body .= "Date Paid:         " . ($donation->paid_at ?: current_time('mysql')) . "\n";
         $body .= "Designated Cause:  " . $donation->purpose_snapshot . "\n";
-        $body .= "Amount Received:   " . $amount_str . "\n";
-        $body .= "Payment Method:    PayPal (Verified Server-Side Capture)\n";
+        $method_label = (isset($donation->gateway_provider) && $donation->gateway_provider === 'stripe') ? 'Stripe (Verified Transaction)' : 'PayPal (Verified Server-Side Capture)';
+        $body .= "Payment Method:    " . $method_label . "\n";
         $body .= "Transaction ID:    " . $capture_id . "\n";
         $body .= "Status:            COMPLETED\n";
         $body .= "--------------------------------------------------\n\n";

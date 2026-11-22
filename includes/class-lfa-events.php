@@ -369,7 +369,7 @@ final class LFA_Events {
             $cat_images = [
                 'reunion'    => 'omaha-podium-2025.jpg',
                 'virtual'    => 'original-five-person-community.jpg',
-                'community'  => 'original-alumni-group.jpg',
+                'community'  => 'alumni-group-wide.jpg',
                 'conference' => 'conference-cinematic-bg.jpg',
             ];
             $chosen = $cat_images[$cat_slug] ?? 'conference-cinematic-bg.jpg';

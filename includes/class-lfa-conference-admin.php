@@ -20,6 +20,7 @@ final class LFA_Conference_Admin {
         add_action('admin_post_lfa_delete_conference', [__CLASS__, 'handle_delete_conference']);
         add_action('admin_post_lfa_save_conference_policy', [__CLASS__, 'handle_save_policy']);
         add_action('admin_post_lfa_save_conference_ticket', [__CLASS__, 'handle_save_ticket']);
+        add_action('admin_post_lfa_delete_conference_ticket', [__CLASS__, 'handle_delete_ticket']);
         add_action('admin_post_lfa_export_conference_attendees', [__CLASS__, 'handle_export_csv']);
         add_action('admin_post_lfa_save_conference_speaker', [__CLASS__, 'handle_save_speaker']);
         add_action('admin_post_lfa_delete_conference_speaker', [__CLASS__, 'handle_delete_speaker']);
@@ -125,6 +126,8 @@ final class LFA_Conference_Admin {
             'program_info'               => sanitize_textarea_field($_POST['program_info'] ?? ''),
             'sponsorship'                => sanitize_textarea_field($_POST['sponsorship'] ?? ''),
             'refund_policy'              => sanitize_textarea_field($_POST['refund_policy'] ?? ''),
+            'banner_image_url'           => !empty($_POST['banner_image_url']) ? esc_url_raw($_POST['banner_image_url']) : '',
+            'banner_image_id'            => !empty($_POST['banner_image_id']) ? (int)$_POST['banner_image_id'] : 0,
         ];
 
         if ($conf_id > 0) {
@@ -197,11 +200,8 @@ final class LFA_Conference_Admin {
 
         global $wpdb;
         $t_conf = LFA_Conference::table_conferences();
-        $conf_id = (int)($_POST['conference_id'] ?? 1);
+        $conf_id = (int)($_POST['conference_id'] ?? 0);
         $conf = LFA_Conference::get_conference_by_id($conf_id);
-        if (!$conf) {
-            $conf = LFA_Conference::get_conference();
-        }
         if (!$conf) {
             wp_die('Conference record not found.');
         }
@@ -212,11 +212,41 @@ final class LFA_Conference_Admin {
         }
 
         $guest_enabled = !empty($_POST['guest_registration_enabled']) ? 1 : 0;
-        $timezone      = sanitize_text_field($_POST['timezone'] ?? 'America/New_York');
-        $location      = sanitize_text_field($_POST['location_summary'] ?? 'North America Zone (Host City TBA)');
+        $timezone      = sanitize_text_field($_POST['timezone'] ?? $conf->timezone);
+        $location      = sanitize_text_field($_POST['location_summary'] ?? $conf->location_summary);
 
-        $opens_at  = !empty($_POST['registration_opens_at']) ? sanitize_text_field($_POST['registration_opens_at']) : null;
-        $closes_at = !empty($_POST['registration_closes_at']) ? sanitize_text_field($_POST['registration_closes_at']) : null;
+        // Registration window: admin enters site-local time, stored as GMT
+        $to_gmt = static function (string $key): ?string {
+            $raw = isset($_POST[$key]) ? trim(sanitize_text_field(wp_unslash($_POST[$key]))) : '';
+            if ($raw === '') {
+                return null;
+            }
+            $raw = str_replace('T', ' ', $raw);
+            if (strlen($raw) === 16) {
+                $raw .= ':00';
+            }
+            return get_gmt_from_date($raw, 'Y-m-d H:i:s');
+        };
+        $opens_at  = $to_gmt('registration_opens_at');
+        $closes_at = $to_gmt('registration_closes_at');
+
+        if ($opens_at && $closes_at && strtotime($closes_at) <= strtotime($opens_at)) {
+            wp_safe_redirect(add_query_arg([
+                'page'       => 'lfa-conference-policy',
+                'id'         => $conf->id,
+                'lfa_notice' => 'window_invalid',
+            ], admin_url('users.php')));
+            exit;
+        }
+
+        // Published fee / refund policy (shown on the public conference page)
+        $details = json_decode($conf->details_json ?: '{}', true) ?: [];
+        if (isset($_POST['refund_policy'])) {
+            $details['refund_policy'] = sanitize_textarea_field(wp_unslash($_POST['refund_policy']));
+        }
+        if (isset($_POST['registration_notes'])) {
+            $details['registration_notes'] = sanitize_textarea_field(wp_unslash($_POST['registration_notes']));
+        }
 
         $now = current_time('mysql', true);
         $wpdb->update($t_conf, [
@@ -226,6 +256,7 @@ final class LFA_Conference_Admin {
             'location_summary'           => $location,
             'registration_opens_at'      => $opens_at,
             'registration_closes_at'     => $closes_at,
+            'details_json'               => wp_json_encode($details),
             'updated_at'                 => $now,
         ], ['id' => $conf->id]);
 
@@ -233,12 +264,35 @@ final class LFA_Conference_Admin {
             'registration_status'        => $reg_status,
             'guest_registration_enabled' => $guest_enabled,
             'timezone'                   => $timezone,
+            'registration_opens_at'      => $opens_at,
+            'registration_closes_at'     => $closes_at,
         ]);
 
         wp_safe_redirect(add_query_arg([
             'page'       => 'lfa-conference-policy',
             'id'         => $conf->id,
             'lfa_notice' => 'policy_saved',
+        ], admin_url('users.php')));
+        exit;
+    }
+
+    /**
+     * Handle Delete Ticket Type POST
+     */
+    public static function handle_delete_ticket(): void {
+        if (!current_user_can(LFA_Conference::CAP_MANAGE_CONFERENCES)) {
+            wp_die('Unauthorized.', 'Forbidden', ['response' => 403]);
+        }
+        check_admin_referer('lfa_delete_conference_ticket_action', 'lfa_ticket_del_nonce');
+
+        $ticket_id = (int)($_POST['ticket_id'] ?? 0);
+        $conf_id   = (int)($_POST['conference_id'] ?? 0);
+        $res = LFA_Conference::delete_ticket_type($ticket_id, get_current_user_id());
+
+        wp_safe_redirect(add_query_arg([
+            'page'       => 'lfa-conference-policy',
+            'id'         => $res['conference_id'] ?? $conf_id,
+            'lfa_notice' => $res['success'] ? 'ticket_deleted' : 'ticket_in_use',
         ], admin_url('users.php')));
         exit;
     }
@@ -256,16 +310,58 @@ final class LFA_Conference_Admin {
         global $wpdb;
         $t_tickets = LFA_Conference::table_ticket_types();
         $ticket_id = (int)($_POST['ticket_id'] ?? 0);
-        $conf_id = (int)($_POST['conference_id'] ?? 1);
-        $ticket = LFA_Conference::get_ticket_type($ticket_id);
-        if (!$ticket) {
-            wp_die('Ticket type not found.');
+        $conf_id   = (int)($_POST['conference_id'] ?? 0);
+        $redirect  = static function (string $notice) use ($conf_id): void {
+            wp_safe_redirect(add_query_arg([
+                'page'       => 'lfa-conference-policy',
+                'id'         => $conf_id,
+                'lfa_notice' => $notice,
+            ], admin_url('users.php')));
+            exit;
+        };
+
+        if (!LFA_Conference::get_conference_by_id($conf_id)) {
+            wp_die('Conference record not found.');
         }
 
-        $name        = sanitize_text_field($_POST['name'] ?? $ticket->name);
-        $description = sanitize_textarea_field($_POST['description'] ?? $ticket->description);
-        $active      = !empty($_POST['active']) ? 1 : 0;
-        $capacity    = (isset($_POST['capacity']) && $_POST['capacity'] !== '') ? (int)$_POST['capacity'] : null;
+        $active   = !empty($_POST['active']) ? 1 : 0;
+        $capacity = (isset($_POST['capacity']) && $_POST['capacity'] !== '' && (int)$_POST['capacity'] > 0) ? (int)$_POST['capacity'] : null;
+
+        // ---- Create new ticket category ----
+        if ($ticket_id === 0) {
+            $amount_cents = null;
+            if (isset($_POST['amount_dollars']) && trim((string)$_POST['amount_dollars']) !== '') {
+                $dollars = (float) trim((string)$_POST['amount_dollars']);
+                if ($dollars > 0) {
+                    $amount_cents = (int) round($dollars * 100);
+                }
+            }
+            $res = LFA_Conference::create_ticket_type($conf_id, [
+                'name'         => wp_unslash($_POST['name'] ?? ''),
+                'description'  => wp_unslash($_POST['description'] ?? ''),
+                'amount_cents' => $amount_cents,
+                'capacity'     => $capacity,
+                'active'       => $active,
+                'eligibility'  => $_POST['eligibility'] ?? 'members_only',
+            ], get_current_user_id());
+
+            if (!$res['success']) {
+                $redirect($res['code'] === 'PRICE_REQUIRED' ? 'ticket_price_required' : 'ticket_create_failed');
+            }
+            $redirect('ticket_created');
+        }
+
+        // ---- Update existing ticket category ----
+        $ticket = LFA_Conference::get_ticket_type($ticket_id);
+        if (!$ticket || (int)$ticket->conference_id !== $conf_id) {
+            wp_die('Ticket type not found for this conference.');
+        }
+
+        $name        = sanitize_text_field(wp_unslash($_POST['name'] ?? $ticket->name));
+        $description = sanitize_textarea_field(wp_unslash($_POST['description'] ?? $ticket->description));
+        if ($name === '') {
+            $name = $ticket->name;
+        }
 
         // Price in USD: convert dollars to integer cents
         // If left empty: remains NULL! Missing amount is NOT 0 or free
@@ -439,6 +535,13 @@ final class LFA_Conference_Admin {
         $conf_id = (int)($_GET['id'] ?? 0);
         $conf = $conf_id > 0 ? LFA_Conference::get_conference_by_id($conf_id) : null;
         $details = $conf ? (json_decode($conf->details_json ?: '{}', true) ?: []) : [];
+
+        wp_enqueue_media();
+        $banner_url = !empty($details['banner_image_url']) ? $details['banner_image_url'] : '';
+        $banner_id  = !empty($details['banner_image_id']) ? (int)$details['banner_image_id'] : 0;
+        if (empty($banner_url) && $banner_id > 0) {
+            $banner_url = wp_get_attachment_image_url($banner_id, 'large');
+        }
         ?>
         <div class="wrap">
             <h1 class="wp-heading-inline"><?php echo $conf ? 'Edit Conference: ' . esc_html($conf->title) : 'Create New Conference'; ?></h1>
@@ -507,7 +610,8 @@ final class LFA_Conference_Admin {
                             </tr>
                             <tr>
                                 <th scope="row"><label for="program_info">Daily Schedule &amp; Workshops</label></th>
-                                <td><textarea name="program_info" id="program_info" class="widefat" rows="3"><?php echo esc_textarea($details['program_info'] ?? ''); ?></textarea></td>
+                                <td><textarea name="program_info" id="program_info" class="widefat" rows="8" placeholder="Day 1 — Thursday, August 12:&#10;9:00 AM — Registration &amp; Welcome&#10;6:00 PM — Opening Worship Service"><?php echo esc_textarea($details['program_info'] ?? ''); ?></textarea>
+                                    <p class="description">One entry per line. A line ending with <code>:</code> becomes a day heading; use <code>Time — Session</code> for timed items. Leave empty (or a "TBA / will be released" note) to show the "schedule pending" view on the conference page.</p></td>
                             </tr>
                             <tr>
                                 <th scope="row"><label for="sponsorship">Sponsorship &amp; Partnership Information</label></th>
@@ -526,7 +630,59 @@ final class LFA_Conference_Admin {
                                     </label>
                                 </td>
                             </tr>
+                            <tr>
+                                <th scope="row"><label>Cover Banner / Featured Image</label></th>
+                                <td>
+                                    <input type="hidden" name="banner_image_id" id="lfa_conf_banner_id" value="<?php echo esc_attr($banner_id); ?>">
+                                    <input type="hidden" name="banner_image_url" id="lfa_conf_banner_url" value="<?php echo esc_url($banner_url); ?>">
+                                    <div id="lfa_conf_banner_preview_wrap" style="margin-bottom: 12px; <?php echo empty($banner_url) ? 'display:none;' : ''; ?>">
+                                        <img id="lfa_conf_banner_preview" src="<?php echo esc_url($banner_url); ?>" alt="Banner Preview" style="max-width: 480px; max-height: 220px; border-radius: 8px; border: 1px solid #ccd0d4; display: block; object-fit: cover;">
+                                    </div>
+                                    <button type="button" class="button button-secondary" id="lfa_conf_upload_btn">
+                                        <?php echo $banner_url ? 'Change Cover Banner' : 'Select Cover Banner'; ?>
+                                    </button>
+                                    <button type="button" class="button button-link-delete" id="lfa_conf_remove_btn" style="<?php echo empty($banner_url) ? 'display:none;' : ''; ?> margin-left: 10px;">
+                                        Remove Banner
+                                    </button>
+                                    <p class="description">Displays on the conference index, conference cards, and detail page header.</p>
+                                </td>
+                            </tr>
                         </table>
+
+                        <script>
+                        jQuery(document).ready(function($) {
+                            var confFrame;
+                            $('#lfa_conf_upload_btn').on('click', function(e) {
+                                e.preventDefault();
+                                if (confFrame) { confFrame.open(); return; }
+                                confFrame = wp.media({
+                                    title: 'Select or Upload Conference Cover Banner',
+                                    button: { text: 'Set Cover Banner' },
+                                    multiple: false
+                                });
+                                confFrame.on('select', function() {
+                                    var attachment = confFrame.state().get('selection').first().toJSON();
+                                    $('#lfa_conf_banner_id').val(attachment.id);
+                                    var url = (attachment.sizes && attachment.sizes.large) ? attachment.sizes.large.url : attachment.url;
+                                    $('#lfa_conf_banner_url').val(url);
+                                    $('#lfa_conf_banner_preview').attr('src', url);
+                                    $('#lfa_conf_banner_preview_wrap').show();
+                                    $('#lfa_conf_remove_btn').show();
+                                    $('#lfa_conf_upload_btn').text('Change Cover Banner');
+                                });
+                                confFrame.open();
+                            });
+                            $('#lfa_conf_remove_btn').on('click', function(e) {
+                                e.preventDefault();
+                                $('#lfa_conf_banner_id').val('');
+                                $('#lfa_conf_banner_url').val('');
+                                $('#lfa_conf_banner_preview').attr('src', '');
+                                $('#lfa_conf_banner_preview_wrap').hide();
+                                $(this).hide();
+                                $('#lfa_conf_upload_btn').text('Select Cover Banner');
+                            });
+                        });
+                        </script>
 
                         <p class="submit">
                             <button type="submit" class="button button-primary button-large">Save Conference</button>
@@ -547,66 +703,145 @@ final class LFA_Conference_Admin {
             wp_die('Unauthorized');
         }
 
-        $conf_id = (int)($_GET['id'] ?? 0);
-        $conf = $conf_id > 0 ? LFA_Conference::get_conference_by_id($conf_id) : LFA_Conference::get_conference();
+        $all_confs = LFA_Conference::get_all_conferences();
+        $conf_id   = (int)($_GET['id'] ?? 0);
+        $conf      = $conf_id > 0 ? LFA_Conference::get_conference_by_id($conf_id) : null;
         if (!$conf) {
-            $conf = LFA_Conference::get_conference_by_id(1);
+            $upcoming = LFA_Conference::get_upcoming_conferences();
+            $conf = $upcoming[0] ?? ($all_confs[0] ?? null);
         }
 
-        $all_confs = LFA_Conference::get_all_conferences();
-        $tickets = $conf ? LFA_Conference::get_ticket_types((int)$conf->id) : [];
-        $notice = $_GET['lfa_notice'] ?? '';
+        $tickets   = $conf ? LFA_Conference::get_ticket_types((int)$conf->id) : [];
+        $details   = $conf ? (json_decode($conf->details_json ?: '{}', true) ?: []) : [];
+        $reg_state = LFA_Conference::get_registration_state($conf);
+        $notice    = sanitize_key($_GET['lfa_notice'] ?? '');
+
+        // Actual enrolment per ticket (registered_count only tracks capped tickets)
+        $ticket_usage = [];
+        if ($conf) {
+            global $wpdb;
+            $t_reg = LFA_Conference::table_registrations();
+            $rows  = $wpdb->get_results($wpdb->prepare(
+                "SELECT ticket_type_id, COUNT(*) AS total,
+                        SUM(CASE WHEN status = 'confirmed' THEN 1 ELSE 0 END) AS confirmed
+                 FROM {$t_reg} WHERE conference_id = %d GROUP BY ticket_type_id",
+                $conf->id
+            ));
+            foreach ($rows as $r) {
+                $ticket_usage[(int)$r->ticket_type_id] = ['total' => (int)$r->total, 'confirmed' => (int)$r->confirmed];
+            }
+        }
+
+        // GMT → site-local for datetime-local inputs
+        $to_local_input = static function (?string $gmt): string {
+            return $gmt ? get_date_from_gmt($gmt, 'Y-m-d\TH:i') : '';
+        };
+
+        $notices = [
+            'policy_saved'          => ['success', 'Registration policy saved.'],
+            'ticket_saved'          => ['success', 'Ticket category updated.'],
+            'ticket_created'        => ['success', 'New ticket category added.'],
+            'ticket_deleted'        => ['success', 'Ticket category deleted.'],
+            'ticket_in_use'         => ['error', 'This ticket category already has registrations and cannot be deleted. Deactivate it instead.'],
+            'ticket_create_failed'  => ['error', 'Ticket category could not be created. A name is required.'],
+            'ticket_price_required' => ['error', 'An active ticket category must have a confirmed positive USD price. Missing amounts cannot be activated or treated as free.'],
+            'window_invalid'        => ['error', 'Registration closing time must be after the opening time.'],
+        ];
+
+        $state_colors = [
+            'open'          => ['#dcfce7', '#166534'],
+            'not_started'   => ['#e0e7ff', '#3730a3'],
+            'paused'        => ['#fef3c7', '#92400e'],
+            'no_tickets'    => ['#fee2e2', '#991b1b'],
+        ];
+        [$st_bg, $st_fg] = $state_colors[$reg_state['code']] ?? ['#f1f5f9', '#475569'];
+
+        $pub_colors = ['published' => '#46b450', 'draft' => '#dba617', 'archived' => '#787c82', 'unpublished' => '#787c82'];
+        $card = 'background:#fff;border:1px solid #ccd0d4;border-radius:8px;padding:20px;margin-bottom:24px;max-width:960px;';
+        $h2   = 'margin-top:0;border-bottom:1px solid #eee;padding-bottom:10px;';
         ?>
         <div class="wrap">
             <h1 class="wp-heading-inline">Conference Policy &amp; Ticket Configuration</h1>
+            <a href="<?php echo esc_url(admin_url('users.php?page=lfa-conferences')); ?>" class="page-title-action">All Conferences</a>
             <hr class="wp-header-end">
+
+            <?php if (isset($notices[$notice])) : ?>
+                <div class="notice notice-<?php echo esc_attr($notices[$notice][0]); ?> is-dismissible"><p><strong><?php echo esc_html($notices[$notice][1]); ?></strong></p></div>
+            <?php endif; ?>
+
+            <?php if (empty($all_confs)) : ?>
+                <div style="<?php echo esc_attr($card); ?>">
+                    <p>No conferences exist yet. <a href="<?php echo esc_url(admin_url('users.php?page=lfa-conferences')); ?>">Create a conference</a> first, then configure its registration policy and tickets here.</p>
+                </div>
+            <?php else : ?>
 
             <!-- Conference Selector -->
             <div style="margin:15px 0;">
                 <label for="conf-select"><strong>Select Conference:</strong></label>
                 <select id="conf-select" onchange="window.location.href='<?php echo esc_url(admin_url('users.php?page=lfa-conference-policy&id=')); ?>' + this.value;">
-                    <?php foreach ($all_confs as $c): ?>
-                        <option value="<?php echo (int)$c->id; ?>" <?php selected($conf && $conf->id == $c->id); ?>>
-                            <?php echo esc_html($c->title . ' (' . $c->slug . ')'); ?>
+                    <?php foreach ($all_confs as $c) :
+                        $c_state = LFA_Conference::get_registration_state($c); ?>
+                        <option value="<?php echo (int)$c->id; ?>" <?php selected($conf && (int)$conf->id === (int)$c->id); ?>>
+                            <?php echo esc_html(sprintf('%s (%s) — %s · %s', $c->title, $c->slug, ucfirst($c->published_status), $c_state['label'])); ?>
                         </option>
                     <?php endforeach; ?>
                 </select>
             </div>
 
-            <?php if ($notice === 'policy_saved') : ?>
-                <div class="notice notice-success is-dismissible"><p><strong>Conference policy updated successfully.</strong></p></div>
-            <?php elseif ($notice === 'ticket_saved') : ?>
-                <div class="notice notice-success is-dismissible"><p><strong>Ticket category updated successfully.</strong></p></div>
-            <?php elseif ($notice === 'ticket_price_required') : ?>
-                <div class="notice notice-error is-dismissible"><p><strong>Error:</strong> An active ticket category must have a confirmed positive USD price. Missing amounts cannot be activated or treated as free.</p></div>
-            <?php endif; ?>
-
             <?php if ($conf) : ?>
-                <div style="background:#fff;border:1px solid #ccd0d4;border-radius:8px;padding:20px;margin-bottom:24px;max-width:960px;">
-                    <h2 style="margin-top:0;border-bottom:1px solid #eee;padding-bottom:10px;">Event Overview</h2>
+                <div style="<?php echo esc_attr($card); ?>">
+                    <h2 style="<?php echo esc_attr($h2); ?>">Event Overview</h2>
                     <table class="form-table" role="presentation">
                         <tr>
                             <th scope="row">Conference Title</th>
-                            <td><strong><?php echo esc_html($conf->title); ?></strong></td>
+                            <td>
+                                <strong><?php echo esc_html($conf->title); ?></strong>
+                                &nbsp;<a href="<?php echo esc_url(admin_url('users.php?page=lfa-conference-edit&id=' . (int)$conf->id)); ?>">Edit details</a>
+                                <?php if ($conf->published_status === 'published') : ?>
+                                    &middot; <a href="<?php echo esc_url(LFA_Conference::get_conference_url($conf)); ?>" target="_blank">View public page ↗</a>
+                                <?php endif; ?>
+                            </td>
                         </tr>
+                        <?php if ($conf->theme) : ?>
                         <tr>
                             <th scope="row">Theme &amp; Verse</th>
-                            <td><em>“<?php echo esc_html($conf->theme); ?>”</em> &mdash; <strong><?php echo esc_html($conf->verse); ?></strong></td>
+                            <td><em>“<?php echo esc_html($conf->theme); ?>”</em><?php if ($conf->verse) : ?> &mdash; <strong><?php echo esc_html($conf->verse); ?></strong><?php endif; ?></td>
                         </tr>
+                        <?php endif; ?>
                         <tr>
                             <th scope="row">Dates</th>
-                            <td><strong><?php echo esc_html($conf->starts_at . ' to ' . $conf->ends_at); ?></strong></td>
+                            <td><strong><?php echo esc_html(LFA_Conference::format_date_range($conf)); ?></strong></td>
                         </tr>
                         <tr>
                             <th scope="row">Publication Status</th>
-                            <td><span class="badge" style="background:#46b450;color:#fff;padding:3px 8px;border-radius:4px;font-weight:700;"><?php echo esc_html(strtoupper($conf->published_status)); ?></span></td>
+                            <td><span style="background:<?php echo esc_attr($pub_colors[$conf->published_status] ?? '#787c82'); ?>;color:#fff;padding:3px 8px;border-radius:4px;font-weight:700;"><?php echo esc_html(strtoupper($conf->published_status)); ?></span></td>
+                        </tr>
+                        <tr>
+                            <th scope="row">Member Registration</th>
+                            <td>
+                                <span style="background:<?php echo esc_attr($st_bg); ?>;color:<?php echo esc_attr($st_fg); ?>;padding:3px 8px;border-radius:4px;font-weight:700;"><?php echo esc_html($reg_state['label']); ?></span>
+                                <p class="description" style="margin-top:6px;"><?php echo esc_html($reg_state['message']); ?></p>
+                            </td>
                         </tr>
                     </table>
+
+                    <?php if ($conf->registration_status === 'open' && !$reg_state['is_open']) : ?>
+                        <div class="notice notice-warning inline" style="margin:12px 0 0;"><p>
+                            <strong>Registration is set to “Open”, but members still cannot register.</strong>
+                            <?php if ($reg_state['code'] === 'no_tickets') : ?>
+                                Add at least one <em>active</em> ticket category with a confirmed price below.
+                            <?php elseif ($reg_state['code'] === 'not_published') : ?>
+                                Publish this conference from the Conferences list.
+                            <?php else : ?>
+                                <?php echo esc_html($reg_state['message']); ?>
+                            <?php endif; ?>
+                        </p></div>
+                    <?php endif; ?>
                 </div>
 
                 <!-- Registration Controls Form -->
-                <div style="background:#fff;border:1px solid #ccd0d4;border-radius:8px;padding:20px;margin-bottom:24px;max-width:960px;">
-                    <h2 style="margin-top:0;border-bottom:1px solid #eee;padding-bottom:10px;">Registration Policy &amp; Availability</h2>
+                <div style="<?php echo esc_attr($card); ?>">
+                    <h2 style="<?php echo esc_attr($h2); ?>">Registration Policy &amp; Availability</h2>
                     <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
                         <input type="hidden" name="action" value="lfa_save_conference_policy">
                         <input type="hidden" name="conference_id" value="<?php echo (int)$conf->id; ?>">
@@ -619,9 +854,21 @@ final class LFA_Conference_Admin {
                                     <select name="registration_status" id="registration_status">
                                         <option value="closed" <?php selected($conf->registration_status, 'closed'); ?>>Closed (Default &mdash; Not Yet Open Notice)</option>
                                         <option value="open" <?php selected($conf->registration_status, 'open'); ?>>Open (Active Registration Enabled)</option>
-                                        <option value="paused" <?php selected($conf->registration_status, 'paused'); ?>>Paused / Waitlist Only</option>
+                                        <option value="paused" <?php selected($conf->registration_status, 'paused'); ?>>Paused (Temporarily stop new registrations)</option>
                                     </select>
-                                    <p class="description">Registration must remain closed until ticket rates are confirmed by the committee.</p>
+                                    <p class="description">Members can register only when: the conference is <strong>published</strong>, status is <strong>Open</strong>, the current time is inside the registration window (if set), and at least one <strong>active, priced</strong> ticket category exists.</p>
+                                </td>
+                            </tr>
+                            <tr>
+                                <th scope="row"><label for="registration_opens_at">Registration Window</label></th>
+                                <td>
+                                    <label style="display:inline-block;margin-right:18px;">Opens<br>
+                                        <input type="datetime-local" name="registration_opens_at" id="registration_opens_at" value="<?php echo esc_attr($to_local_input($conf->registration_opens_at)); ?>">
+                                    </label>
+                                    <label style="display:inline-block;">Closes (deadline)<br>
+                                        <input type="datetime-local" name="registration_closes_at" id="registration_closes_at" value="<?php echo esc_attr($to_local_input($conf->registration_closes_at)); ?>">
+                                    </label>
+                                    <p class="description">Optional. Site timezone (<?php echo esc_html(wp_timezone_string()); ?>). Leave blank for no limit.</p>
                                 </td>
                             </tr>
                             <tr>
@@ -641,18 +888,32 @@ final class LFA_Conference_Admin {
                                 <th scope="row"><label for="location_summary">Venue / Host City</label></th>
                                 <td><input type="text" name="location_summary" id="location_summary" value="<?php echo esc_attr($conf->location_summary); ?>" class="regular-text"></td>
                             </tr>
+                            <tr>
+                                <th scope="row"><label for="refund_policy">Fee &amp; Refund Policy</label></th>
+                                <td>
+                                    <textarea name="refund_policy" id="refund_policy" rows="5" class="large-text"><?php echo esc_textarea($details['refund_policy'] ?? ''); ?></textarea>
+                                    <p class="description">Published on this conference's public page beside the registration form.</p>
+                                </td>
+                            </tr>
+                            <tr>
+                                <th scope="row"><label for="registration_notes">Registration Notes</label></th>
+                                <td>
+                                    <textarea name="registration_notes" id="registration_notes" rows="3" class="large-text" placeholder="e.g. Fee includes banquet, materials and lunch on all days."><?php echo esc_textarea($details['registration_notes'] ?? ''); ?></textarea>
+                                    <p class="description">Optional extra information shown to members when registering.</p>
+                                </td>
+                            </tr>
                         </table>
 
                         <p class="submit">
-                            <button type="submit" class="button button-primary">Save Conference Policy</button>
+                            <button type="submit" class="button button-primary">Save Registration Policy</button>
                         </p>
                     </form>
                 </div>
 
                 <!-- Ticket Categories Configuration -->
-                <div style="background:#fff;border:1px solid #ccd0d4;border-radius:8px;padding:20px;max-width:960px;">
-                    <h2 style="margin-top:0;border-bottom:1px solid #eee;padding-bottom:10px;">Ticket Categories &amp; Rates</h2>
-                    <p><em>Rule: Unknown ticket amounts remain unconfigured (NULL). They are never treated as $0 or free.</em></p>
+                <div style="<?php echo esc_attr($card); ?>">
+                    <h2 style="<?php echo esc_attr($h2); ?>">Ticket Categories &amp; Rates</h2>
+                    <p><em>Rule: Unknown ticket amounts remain unconfigured (NULL). They are never treated as $0 or free. Only <strong>active</strong> categories with a confirmed price are offered to members.</em></p>
 
                     <table class="widefat striped" style="margin-top:16px;">
                         <thead>
@@ -661,15 +922,16 @@ final class LFA_Conference_Admin {
                                 <th>Description</th>
                                 <th>Fee (USD)</th>
                                 <th>Capacity</th>
-                                <th>Enrolled</th>
+                                <th>Registrations</th>
                                 <th>Status</th>
                                 <th>Configure</th>
                             </tr>
                         </thead>
                         <tbody>
                             <?php if (empty($tickets)) : ?>
-                                <tr><td colspan="7">No ticket categories configured for this event.</td></tr>
-                            <?php else : foreach ($tickets as $t) : ?>
+                                <tr><td colspan="7">No ticket categories configured for this conference yet. Add one below.</td></tr>
+                            <?php else : foreach ($tickets as $t) :
+                                $usage = $ticket_usage[(int)$t->id] ?? ['total' => 0, 'confirmed' => 0]; ?>
                                 <tr>
                                     <td><strong><?php echo esc_html($t->name); ?></strong><br><code><?php echo esc_html($t->slug); ?></code></td>
                                     <td><?php echo esc_html($t->description); ?></td>
@@ -677,54 +939,43 @@ final class LFA_Conference_Admin {
                                         <?php if (is_null($t->amount_cents)) : ?>
                                             <span style="color:#d9534f;font-weight:700;">TBA (Unconfigured)</span>
                                         <?php else : ?>
-                                            <strong>$<?php echo number_format($t->amount_cents / 100, 2); ?></strong>
+                                            <strong>$<?php echo esc_html(number_format($t->amount_cents / 100, 2)); ?></strong>
                                         <?php endif; ?>
                                     </td>
                                     <td><?php echo is_null($t->capacity) ? 'Unlimited' : (int)$t->capacity; ?></td>
-                                    <td><?php echo (int)$t->registered_count; ?></td>
+                                    <td><?php echo (int)$usage['total']; ?> <small style="color:#646970;">(<?php echo (int)$usage['confirmed']; ?> paid)</small></td>
                                     <td>
                                         <?php if ($t->active) : ?>
-                                            <span class="badge" style="background:#46b450;color:#fff;padding:2px 6px;border-radius:3px;">ACTIVE</span>
+                                            <span style="background:#46b450;color:#fff;padding:2px 6px;border-radius:3px;">ACTIVE</span>
                                         <?php else : ?>
-                                            <span class="badge" style="background:#999;color:#fff;padding:2px 6px;border-radius:3px;">INACTIVE</span>
+                                            <span style="background:#999;color:#fff;padding:2px 6px;border-radius:3px;">INACTIVE</span>
                                         <?php endif; ?>
                                     </td>
                                     <td>
                                         <details>
                                             <summary class="button button-small">Edit</summary>
-                                            <div style="margin-top:10px;padding:12px;background:#f9f9f9;border:1px solid #ddd;border-radius:4px;">
+                                            <div style="margin-top:10px;padding:12px;background:#f9f9f9;border:1px solid #ddd;border-radius:4px;min-width:240px;">
                                                 <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
                                                     <input type="hidden" name="action" value="lfa_save_conference_ticket">
                                                     <input type="hidden" name="ticket_id" value="<?php echo (int)$t->id; ?>">
                                                     <input type="hidden" name="conference_id" value="<?php echo (int)$conf->id; ?>">
                                                     <?php wp_nonce_field('lfa_save_conference_ticket_action', 'lfa_ticket_nonce'); ?>
-
-                                                    <p>
-                                                        <label>Category Name:<br>
-                                                        <input type="text" name="name" value="<?php echo esc_attr($t->name); ?>" class="widefat"></label>
-                                                    </p>
-                                                    <p>
-                                                        <label>Description:<br>
-                                                        <textarea name="description" class="widefat" rows="2"><?php echo esc_textarea($t->description); ?></textarea></label>
-                                                    </p>
-                                                    <p>
-                                                        <label>Confirmed Price (USD):<br>
-                                                        <input type="number" step="0.01" min="0" name="amount_dollars" value="<?php echo is_null($t->amount_cents) ? '' : number_format($t->amount_cents / 100, 2, '.', ''); ?>" placeholder="Leave blank if TBA" class="small-text" style="width:120px;"></label>
-                                                    </p>
-                                                    <p>
-                                                        <label>Max Capacity:<br>
-                                                        <input type="number" name="capacity" value="<?php echo is_null($t->capacity) ? '' : (int)$t->capacity; ?>" placeholder="Blank = unlimited" class="small-text"></label>
-                                                    </p>
-                                                    <p>
-                                                        <label>
-                                                            <input type="checkbox" name="active" value="1" <?php checked($t->active, 1); ?>>
-                                                            Activate this ticket class (Requires confirmed price &gt; $0)
-                                                        </label>
-                                                    </p>
-                                                    <p>
-                                                        <button type="submit" class="button button-primary button-small">Update Ticket Category</button>
-                                                    </p>
+                                                    <p><label>Category Name:<br><input type="text" name="name" value="<?php echo esc_attr($t->name); ?>" class="widefat" required></label></p>
+                                                    <p><label>Description:<br><textarea name="description" class="widefat" rows="2"><?php echo esc_textarea($t->description); ?></textarea></label></p>
+                                                    <p><label>Confirmed Price (USD):<br><input type="number" step="0.01" min="0" name="amount_dollars" value="<?php echo is_null($t->amount_cents) ? '' : esc_attr(number_format($t->amount_cents / 100, 2, '.', '')); ?>" placeholder="Leave blank if TBA" style="width:120px;"></label></p>
+                                                    <p><label>Max Capacity:<br><input type="number" min="1" name="capacity" value="<?php echo is_null($t->capacity) ? '' : (int)$t->capacity; ?>" placeholder="Blank = unlimited" style="width:120px;"></label></p>
+                                                    <p><label><input type="checkbox" name="active" value="1" <?php checked($t->active, 1); ?>> Active (requires confirmed price &gt; $0)</label></p>
+                                                    <p><button type="submit" class="button button-primary button-small">Update Ticket Category</button></p>
                                                 </form>
+                                                <?php if ($usage['total'] === 0) : ?>
+                                                    <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" onsubmit="return confirm('Delete this ticket category?');" style="border-top:1px solid #ddd;padding-top:8px;">
+                                                        <input type="hidden" name="action" value="lfa_delete_conference_ticket">
+                                                        <input type="hidden" name="ticket_id" value="<?php echo (int)$t->id; ?>">
+                                                        <input type="hidden" name="conference_id" value="<?php echo (int)$conf->id; ?>">
+                                                        <?php wp_nonce_field('lfa_delete_conference_ticket_action', 'lfa_ticket_del_nonce'); ?>
+                                                        <button type="submit" class="button button-link-delete button-small">Delete category</button>
+                                                    </form>
+                                                <?php endif; ?>
                                             </div>
                                         </details>
                                     </td>
@@ -732,7 +983,40 @@ final class LFA_Conference_Admin {
                             <?php endforeach; endif; ?>
                         </tbody>
                     </table>
+
+                    <!-- Add New Ticket Category -->
+                    <h3 style="margin-top:28px;">Add Ticket Category</h3>
+                    <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="background:#f9f9f9;border:1px solid #ddd;border-radius:6px;padding:16px;">
+                        <input type="hidden" name="action" value="lfa_save_conference_ticket">
+                        <input type="hidden" name="ticket_id" value="0">
+                        <input type="hidden" name="conference_id" value="<?php echo (int)$conf->id; ?>">
+                        <?php wp_nonce_field('lfa_save_conference_ticket_action', 'lfa_ticket_nonce'); ?>
+                        <table class="form-table" role="presentation" style="margin:0;">
+                            <tr>
+                                <th scope="row"><label for="new_ticket_name">Category Name *</label></th>
+                                <td><input type="text" name="name" id="new_ticket_name" class="regular-text" required placeholder="e.g. Standard Alumni Member Pass"></td>
+                            </tr>
+                            <tr>
+                                <th scope="row"><label for="new_ticket_desc">Description</label></th>
+                                <td><textarea name="description" id="new_ticket_desc" rows="2" class="large-text" placeholder="What does this pass include?"></textarea></td>
+                            </tr>
+                            <tr>
+                                <th scope="row"><label for="new_ticket_price">Price (USD)</label></th>
+                                <td><input type="number" step="0.01" min="0" name="amount_dollars" id="new_ticket_price" style="width:140px;" placeholder="Blank = TBA"></td>
+                            </tr>
+                            <tr>
+                                <th scope="row"><label for="new_ticket_cap">Max Capacity</label></th>
+                                <td><input type="number" min="1" name="capacity" id="new_ticket_cap" style="width:140px;" placeholder="Blank = unlimited"></td>
+                            </tr>
+                            <tr>
+                                <th scope="row">Availability</th>
+                                <td><label><input type="checkbox" name="active" value="1"> Activate immediately (requires a confirmed price)</label></td>
+                            </tr>
+                        </table>
+                        <p class="submit" style="margin:8px 0 0;padding:0;"><button type="submit" class="button button-primary">Add Ticket Category</button></p>
+                    </form>
                 </div>
+            <?php endif; ?>
             <?php endif; ?>
         </div>
         <?php

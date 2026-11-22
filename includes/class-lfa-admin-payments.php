@@ -88,6 +88,7 @@ final class LFA_Admin_Payments {
         $input = [
             // Global
             'global_payments_kill_switch' => !empty($_POST['global_payments_kill_switch']) ? 1 : 0,
+            'global_live_payments'        => !empty($_POST['global_live_payments']) ? 1 : 0,
             'default_testing_gateway'     => sanitize_key($_POST['default_testing_gateway'] ?? 'stripe'),
 
             // PayPal
@@ -107,11 +108,18 @@ final class LFA_Admin_Payments {
 
             // Stripe
             'stripe_enabled'              => !empty($_POST['stripe_enabled']) ? 1 : 0,
+            'stripe_mode'                 => sanitize_text_field($_POST['stripe_mode'] ?? 'test'),
+            'stripe_live_confirmed'       => !empty($_POST['stripe_live_confirmed']) ? 1 : 0,
             'stripe_test_publishable_key' => sanitize_text_field($_POST['stripe_test_publishable_key'] ?? ''),
             'stripe_test_secret_key'      => sanitize_text_field($_POST['stripe_test_secret_key'] ?? ''),
             'stripe_test_clear_secret'    => !empty($_POST['stripe_test_clear_secret']) ? '1' : '0',
             'stripe_test_webhook_secret'  => sanitize_text_field($_POST['stripe_test_webhook_secret'] ?? ''),
             'stripe_test_clear_webhook'   => !empty($_POST['stripe_test_clear_webhook']) ? '1' : '0',
+            'stripe_live_publishable_key' => sanitize_text_field($_POST['stripe_live_publishable_key'] ?? ''),
+            'stripe_live_secret_key'      => sanitize_text_field($_POST['stripe_live_secret_key'] ?? ''),
+            'stripe_live_clear_secret'    => !empty($_POST['stripe_live_clear_secret']) ? '1' : '0',
+            'stripe_live_webhook_secret'  => sanitize_text_field($_POST['stripe_live_webhook_secret'] ?? ''),
+            'stripe_live_clear_webhook'   => !empty($_POST['stripe_live_clear_webhook']) ? '1' : '0',
         ];
 
         $res = LFA_Gateway_Settings::save_admin_settings($input, get_current_user_id());
@@ -127,7 +135,7 @@ final class LFA_Admin_Payments {
     }
 
     /**
-     * Handle Connection Test for PayPal or Stripe
+     * Handle Connection Test for PayPal or Stripe (Test/Sandbox or Live mode)
      */
     public static function handle_test_gateway_connection(): void {
         if (!current_user_can(LFA_Gateway_Settings::CAPABILITY) && !current_user_can('manage_options')) {
@@ -136,12 +144,13 @@ final class LFA_Admin_Payments {
 
         check_admin_referer('lfa_test_gateway_action', 'lfa_test_nonce');
         $gateway_id = sanitize_key($_POST['gateway_id'] ?? 'stripe');
+        $test_mode  = sanitize_text_field($_POST['test_mode'] ?? '');
 
         if ($gateway_id === 'stripe') {
             $stripe_gw = new LFA_Stripe_Gateway();
-            $res = $stripe_gw->test_connection();
+            $res = $stripe_gw->test_connection($test_mode ?: null);
         } else {
-            $mode = sanitize_text_field($_POST['test_mode'] ?? 'sandbox');
+            $mode = $test_mode ?: 'sandbox';
             $res = LFA_PayPal_Client::test_connection($mode);
         }
 
@@ -152,7 +161,7 @@ final class LFA_Admin_Payments {
             'page'       => 'lfa-payment-gateways',
             'lfa_notice' => $notice,
             'lfa_msg'    => urlencode($msg),
-            'tested_gw'  => $gateway_id,
+            'tested_gw'  => $gateway_id . ($test_mode ? " [{$test_mode}]" : ''),
         ], admin_url('users.php')));
         exit;
     }
@@ -211,25 +220,38 @@ final class LFA_Admin_Payments {
         $paypal_webhook_url = LFA_Gateway_Settings::get_paypal_webhook_url();
         $stripe_webhook_url = LFA_Gateway_Settings::get_stripe_webhook_url();
 
-        $pp_sb_secret_status = !empty($s['paypal_sandbox_secret_enc']) ? '<span style="color:#15803d;font-weight:600;">[Configured &amp; Encrypted at Rest]</span>' : '<span style="color:#b91c1c;">[Not Configured]</span>';
-        $pp_live_secret_status = !empty($s['paypal_live_secret_enc']) ? '<span style="color:#15803d;font-weight:600;">[Configured &amp; Encrypted at Rest]</span>' : '<span style="color:#b91c1c;">[Not Configured]</span>';
+        $secret_status = static function (string $field) use ($s): string {
+            if (empty($s[$field])) {
+                return '<span style="color:#b91c1c;">[Not Configured]</span>';
+            }
+            if (LFA_Gateway_Settings::is_secret_undecryptable($field)) {
+                return '<span style="color:#b91c1c;font-weight:700;">[Stored secret can NOT be decrypted — encryption key changed. Re-enter the secret below and save.]</span>';
+            }
+            return '<span style="color:#15803d;font-weight:600;">[Configured &amp; Encrypted at Rest (AES-256-GCM)]</span>';
+        };
+        $pp_sb_secret_status   = $secret_status('paypal_sandbox_secret_enc');
+        $pp_live_secret_status = $secret_status('paypal_live_secret_enc');
 
-        $str_sk_status = !empty($s['stripe_test_secret_key_enc']) ? '<span style="color:#15803d;font-weight:600;">[Configured &amp; Encrypted at Rest]</span>' : '<span style="color:#b91c1c;">[Not Configured]</span>';
-        $str_wh_status = !empty($s['stripe_test_webhook_secret_enc']) ? '<span style="color:#15803d;font-weight:600;">[Configured &amp; Encrypted at Rest]</span>' : '<span style="color:#b91c1c;">[Not Configured]</span>';
+        $str_test_sk_status = !empty($s['stripe_test_secret_key_enc']) ? '<span style="color:#15803d;font-weight:600;">[Configured &amp; Encrypted at Rest (AES-256-GCM)]</span>' : '<span style="color:#b91c1c;">[Not Configured]</span>';
+        $str_test_wh_status = !empty($s['stripe_test_webhook_secret_enc']) ? '<span style="color:#15803d;font-weight:600;">[Configured &amp; Encrypted at Rest (AES-256-GCM)]</span>' : '<span style="color:#b91c1c;">[Not Configured]</span>';
+
+        $str_live_sk_status = !empty($s['stripe_live_secret_key_enc']) ? '<span style="color:#15803d;font-weight:600;">[Configured &amp; Encrypted at Rest (AES-256-GCM)]</span>' : '<span style="color:#b91c1c;">[Not Configured]</span>';
+        $str_live_wh_status = !empty($s['stripe_live_webhook_secret_enc']) ? '<span style="color:#15803d;font-weight:600;">[Configured &amp; Encrypted at Rest (AES-256-GCM)]</span>' : '<span style="color:#b91c1c;">[Not Configured]</span>';
 
         $kill_switch = (int) $s['global_payments_kill_switch'] === 1;
+        $global_live = (int) ($s['global_live_payments'] ?? 0) === 1;
         ?>
-        <div class="wrap" style="max-width: 1080px;">
+        <div class="wrap" style="max-width: 1120px;">
             <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:16px;margin-bottom:20px;border-bottom:1px solid #cbd5e1;padding-bottom:16px;">
                 <div>
                     <h1 style="margin:0 0 6px 0;font-size:24px;font-weight:800;color:#0f172a;">
-                        Love Family Alumni &mdash; Payment Gateways
+                        Love Family Alumni &mdash; Payment Gateways &amp; Production Setup
                     </h1>
                     <p style="margin:0;color:#64748b;font-size:14px;">
-                        Independent gateway configuration for PayPal and Stripe Test Mode with secure AES-256-GCM encryption.
+                        Enterprise dual-gateway configuration for PayPal &amp; Stripe supporting Sandbox/Test and Live Production with authenticated AES-256-GCM encryption.
                     </p>
                 </div>
-                <div style="display:flex;gap:10px;align-items:center;">
+                <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
                     <?php if ($kill_switch): ?>
                         <span style="background:#dc2626;color:#fff;padding:6px 14px;border-radius:9999px;font-weight:700;font-size:12px;text-transform:uppercase;">
                             🚨 KILL SWITCH ENGAGED (PAYMENTS BLOCKED)
@@ -239,9 +261,16 @@ final class LFA_Admin_Payments {
                             ✓ PAYMENTS OPERATIONAL
                         </span>
                     <?php endif; ?>
-                    <span style="background:#64748b;color:#fff;padding:6px 14px;border-radius:9999px;font-weight:700;font-size:12px;text-transform:uppercase;">
-                        LIVE MODE: OFF
-                    </span>
+
+                    <?php if ($global_live): ?>
+                        <span style="background:#16a34a;color:#fff;padding:6px 14px;border-radius:9999px;font-weight:700;font-size:12px;text-transform:uppercase;">
+                            🟢 LIVE PRODUCTION: ENABLED
+                        </span>
+                    <?php else: ?>
+                        <span style="background:#475569;color:#fff;padding:6px 14px;border-radius:9999px;font-weight:700;font-size:12px;text-transform:uppercase;">
+                            🔒 LIVE PRODUCTION: OFF (TEST / SANDBOX ONLY)
+                        </span>
+                    <?php endif; ?>
                 </div>
             </div>
 
@@ -262,9 +291,9 @@ final class LFA_Admin_Payments {
                 <!-- 1. Global Gateway Controls Panel -->
                 <div style="background:#ffffff;border:1px solid #e2e8f0;border-radius:8px;padding:24px;margin-bottom:24px;box-shadow:0 1px 3px rgba(0,0,0,0.05);">
                     <h2 style="margin:0 0 16px 0;font-size:16px;color:#0f172a;display:flex;align-items:center;gap:8px;">
-                        <span>⚙️ Global Payment Controls</span>
+                        <span>⚙️ Global Payment Controls &amp; Live Switch</span>
                     </h2>
-                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;">
+                    <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(280px, 1fr));gap:20px;">
                         <div style="background:#f8fafc;padding:16px;border-radius:6px;border:1px solid #e2e8f0;">
                             <label style="display:block;font-weight:700;color:#0f172a;margin-bottom:6px;">
                                 <input type="checkbox" name="global_payments_kill_switch" value="1" <?php checked($s['global_payments_kill_switch'], 1); ?>>
@@ -274,16 +303,25 @@ final class LFA_Admin_Payments {
                                 When checked, immediately blocks all new checkouts across PayPal and Stripe. Already initialized transactions will safely reconcile.
                             </p>
                         </div>
+                        <div style="background:<?php echo $global_live ? '#f0fdf4' : '#f8fafc'; ?>;padding:16px;border-radius:6px;border:1px solid <?php echo $global_live ? '#86efac' : '#e2e8f0'; ?>;">
+                            <label style="display:block;font-weight:700;color:#0f172a;margin-bottom:6px;">
+                                <input type="checkbox" name="global_live_payments" value="1" <?php checked($global_live, true); ?>>
+                                Master Live Payments Switch
+                            </label>
+                            <p style="margin:0;font-size:13px;color:<?php echo $global_live ? '#166534' : '#64748b'; ?>;">
+                                Master security gate. When unchecked, all transactions are strictly forced into Sandbox/Test mode to prevent accidental live charges. Enable this when processing real money.
+                            </p>
+                        </div>
                         <div style="background:#f8fafc;padding:16px;border-radius:6px;border:1px solid #e2e8f0;">
                             <label style="display:block;font-weight:700;color:#0f172a;margin-bottom:6px;">
-                                Default Testing Gateway
+                                Default Checkout Gateway
                             </label>
                             <select name="default_testing_gateway" style="width:100%;max-width:280px;">
-                                <option value="stripe" <?php selected($s['default_testing_gateway'], 'stripe'); ?>>Stripe (Test Mode — Recommended)</option>
-                                <option value="paypal" <?php selected($s['default_testing_gateway'], 'paypal'); ?>>PayPal (Sandbox Mode)</option>
+                                <option value="stripe" <?php selected($s['default_testing_gateway'], 'stripe'); ?>>Stripe (Credit / Debit Card &mdash; Recommended)</option>
+                                <option value="paypal" <?php selected($s['default_testing_gateway'], 'paypal'); ?>>PayPal</option>
                             </select>
                             <p style="margin:6px 0 0 0;font-size:13px;color:#64748b;">
-                                Preferred gateway presented to members during development testing when both gateways are enabled.
+                                Preferred gateway presented to members during checkouts when both gateways are enabled.
                             </p>
                         </div>
                     </div>
@@ -291,11 +329,11 @@ final class LFA_Admin_Payments {
 
                 <div style="display:grid;grid-template-columns:1fr 1fr;gap:24px;">
 
-                    <!-- 2. Stripe Test Gateway Configuration Panel -->
+                    <!-- 2. Stripe Gateway Configuration Panel -->
                     <div style="background:#ffffff;border:1px solid #cbd5e1;border-radius:8px;padding:24px;box-shadow:0 1px 3px rgba(0,0,0,0.05);border-top:4px solid #6366f1;">
                         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
                             <h2 style="margin:0;font-size:18px;color:#1e1b4b;display:flex;align-items:center;gap:8px;">
-                                <span>💳 Stripe Test Gateway</span>
+                                <span>💳 Stripe Gateway (Card Payments)</span>
                             </h2>
                             <label style="display:flex;align-items:center;gap:6px;font-weight:700;color:#0f172a;cursor:pointer;">
                                 <input type="checkbox" name="stripe_enabled" value="1" <?php checked($s['stripe_enabled'], 1); ?>>
@@ -303,50 +341,119 @@ final class LFA_Admin_Payments {
                             </label>
                         </div>
 
-                        <div style="background:#eef2ff;border-left:4px solid #6366f1;padding:12px;border-radius:4px;margin-bottom:20px;font-size:13px;color:#3730a3;">
-                            <strong>Environment: Test Mode Only.</strong> Live mode is strictly locked off for development safety. Never enter <code>sk_live_</code> keys.
+                        <div style="margin-bottom:16px;background:#f8fafc;padding:10px 14px;border-radius:6px;border:1px solid #e2e8f0;">
+                            <label style="font-weight:700;color:#0f172a;margin-right:12px;">Stripe Active Mode:</label>
+                            <label style="margin-right:16px;font-weight:600;cursor:pointer;">
+                                <input type="radio" name="stripe_mode" value="test" <?php checked($s['stripe_mode'] ?? 'test', 'test'); ?>>
+                                Test Mode
+                            </label>
+                            <label style="font-weight:600;color:#0f172a;cursor:pointer;">
+                                <input type="radio" name="stripe_mode" value="live" <?php checked($s['stripe_mode'] ?? 'test', 'live'); ?>>
+                                <span style="color:#b91c1c;">● Live (Production)</span>
+                            </label>
                         </div>
 
-                        <table class="form-table" style="margin:0;">
-                            <tr>
-                                <th scope="row" style="width:140px;padding:10px 0;"><label>Publishable Key</label></th>
-                                <td style="padding:10px 0;">
-                                    <input type="text" name="stripe_test_publishable_key" value="<?php echo esc_attr($s['stripe_test_publishable_key']); ?>" class="large-text" placeholder="pk_test_..." autocomplete="off">
-                                    <p class="description">Public client-side key for Stripe Checkout (must start with <code>pk_test_</code>).</p>
-                                </td>
-                            </tr>
-                            <tr>
-                                <th scope="row" style="padding:10px 0;"><label>Secret Key</label></th>
-                                <td style="padding:10px 0;">
-                                    <div style="margin-bottom:6px;"><?php echo $str_sk_status; ?></div>
-                                    <input type="password" name="stripe_test_secret_key" value="" class="large-text" placeholder="Enter new sk_test_... to update" autocomplete="new-password">
-                                    <label style="font-size:12px;color:#64748b;display:inline-block;margin-top:4px;">
-                                        <input type="checkbox" name="stripe_test_clear_secret" value="1"> Clear stored Secret Key
-                                    </label>
-                                </td>
-                            </tr>
-                            <tr>
-                                <th scope="row" style="padding:10px 0;"><label>Webhook Secret</label></th>
-                                <td style="padding:10px 0;">
-                                    <div style="margin-bottom:6px;"><?php echo $str_wh_status; ?></div>
-                                    <input type="password" name="stripe_test_webhook_secret" value="" class="large-text" placeholder="Enter whsec_... to update" autocomplete="new-password">
-                                    <label style="font-size:12px;color:#64748b;display:inline-block;margin-top:4px;">
-                                        <input type="checkbox" name="stripe_test_clear_webhook" value="1"> Clear stored Webhook Secret
-                                    </label>
-                                </td>
-                            </tr>
-                            <tr>
-                                <th scope="row" style="padding:10px 0;"><label>Webhook URL</label></th>
-                                <td style="padding:10px 0;">
-                                    <code style="word-break:break-all;display:block;background:#f1f5f9;padding:8px;border-radius:4px;font-size:12px;"><?php echo esc_html($stripe_webhook_url); ?></code>
-                                    <p class="description">Provide this URL to Stripe CLI or Stripe Dashboard Webhooks (Events: <code>checkout.session.*</code>, <code>payment_intent.*</code>, <code>charge.refunded</code>).</p>
-                                </td>
-                            </tr>
-                        </table>
+                        <?php if (($s['stripe_mode'] ?? 'test') === 'live'): ?>
+                            <div style="background:#fef2f2;border:1px solid #fecaca;padding:12px;border-radius:6px;margin-bottom:16px;">
+                                <label style="display:flex;align-items:flex-start;gap:8px;font-size:13px;color:#991b1b;font-weight:600;cursor:pointer;">
+                                    <input type="checkbox" name="stripe_live_confirmed" value="1" <?php checked($s['stripe_live_confirmed'] ?? 0, 1); ?> style="margin-top:2px;">
+                                    I confirm activation of Stripe Live Production payments with real monetary transactions.
+                                </label>
+                            </div>
+                        <?php endif; ?>
+
+                        <!-- Stripe Live Credentials -->
+                        <div style="border:1px solid #e2e8f0;border-radius:6px;padding:14px;margin-bottom:16px;background:#fcfcfd;">
+                            <h4 style="margin:0 0 10px 0;font-size:14px;color:#0f172a;font-weight:700;display:flex;align-items:center;justify-content:space-between;">
+                                <span>Live (Production) Credentials</span>
+                                <span style="font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;">sk_live_ / pk_live_</span>
+                            </h4>
+                            <table class="form-table" style="margin:0;">
+                                <tr>
+                                    <th scope="row" style="width:130px;padding:8px 0;"><label>Live Publishable Key</label></th>
+                                    <td style="padding:8px 0;">
+                                        <input type="text" name="stripe_live_publishable_key" value="<?php echo esc_attr($s['stripe_live_publishable_key'] ?? ''); ?>" class="large-text" placeholder="pk_live_..." autocomplete="off">
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <th scope="row" style="padding:8px 0;"><label>Live Secret Key</label></th>
+                                    <td style="padding:8px 0;">
+                                        <div style="margin-bottom:4px;font-size:12px;"><?php echo $str_live_sk_status; ?></div>
+                                        <input type="password" name="stripe_live_secret_key" value="" class="large-text" placeholder="Enter new sk_live_... to update" autocomplete="new-password">
+                                        <label style="font-size:12px;color:#64748b;display:inline-block;margin-top:2px;">
+                                            <input type="checkbox" name="stripe_live_clear_secret" value="1"> Clear stored Live Secret Key
+                                        </label>
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <th scope="row" style="padding:8px 0;"><label>Live Webhook Secret</label></th>
+                                    <td style="padding:8px 0;">
+                                        <div style="margin-bottom:4px;font-size:12px;"><?php echo $str_live_wh_status; ?></div>
+                                        <input type="password" name="stripe_live_webhook_secret" value="" class="large-text" placeholder="Enter whsec_... to update" autocomplete="new-password">
+                                        <label style="font-size:12px;color:#64748b;display:inline-block;margin-top:2px;">
+                                            <input type="checkbox" name="stripe_live_clear_webhook" value="1"> Clear stored Live Webhook Secret
+                                        </label>
+                                    </td>
+                                </tr>
+                            </table>
+                        </div>
+
+                        <!-- Stripe Test Credentials -->
+                        <div style="border:1px solid #e2e8f0;border-radius:6px;padding:14px;margin-bottom:16px;background:#f8fafc;">
+                            <h4 style="margin:0 0 10px 0;font-size:14px;color:#334155;font-weight:700;display:flex;align-items:center;justify-content:space-between;">
+                                <span>Test Mode Credentials</span>
+                                <span style="font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;">sk_test_ / pk_test_</span>
+                            </h4>
+                            <table class="form-table" style="margin:0;">
+                                <tr>
+                                    <th scope="row" style="width:130px;padding:8px 0;"><label>Test Publishable Key</label></th>
+                                    <td style="padding:8px 0;">
+                                        <input type="text" name="stripe_test_publishable_key" value="<?php echo esc_attr($s['stripe_test_publishable_key']); ?>" class="large-text" placeholder="pk_test_..." autocomplete="off">
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <th scope="row" style="padding:8px 0;"><label>Test Secret Key</label></th>
+                                    <td style="padding:8px 0;">
+                                        <div style="margin-bottom:4px;font-size:12px;"><?php echo $str_test_sk_status; ?></div>
+                                        <input type="password" name="stripe_test_secret_key" value="" class="large-text" placeholder="Enter new sk_test_... to update" autocomplete="new-password">
+                                        <label style="font-size:12px;color:#64748b;display:inline-block;margin-top:2px;">
+                                            <input type="checkbox" name="stripe_test_clear_secret" value="1"> Clear stored Test Secret Key
+                                        </label>
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <th scope="row" style="padding:8px 0;"><label>Test Webhook Secret</label></th>
+                                    <td style="padding:8px 0;">
+                                        <div style="margin-bottom:4px;font-size:12px;"><?php echo $str_test_wh_status; ?></div>
+                                        <input type="password" name="stripe_test_webhook_secret" value="" class="large-text" placeholder="Enter whsec_... to update" autocomplete="new-password">
+                                        <label style="font-size:12px;color:#64748b;display:inline-block;margin-top:2px;">
+                                            <input type="checkbox" name="stripe_test_clear_webhook" value="1"> Clear stored Test Webhook Secret
+                                        </label>
+                                    </td>
+                                </tr>
+                            </table>
+                        </div>
+
+                        <!-- Webhook URL Info -->
+                        <div style="padding:10px 12px;background:#f1f5f9;border-radius:6px;font-size:12px;color:#334155;margin-bottom:12px;">
+                            <strong>Public Stripe Webhook Listener URL:</strong>
+                            <code style="display:block;background:#ffffff;padding:6px 10px;border-radius:4px;margin-top:4px;word-break:break-all;"><?php echo esc_html($stripe_webhook_url); ?></code>
+                            <div style="color:#64748b;margin-top:4px;">Events: <code>checkout.session.completed</code>, <code>checkout.session.async_payment_succeeded</code>, <code>payment_intent.payment_failed</code>.</div>
+                        </div>
+
+                        <?php if (!empty($s['stripe_live_last_test'])): ?>
+                            <div style="margin-top:12px;padding:10px;background:#f0fdf4;border-radius:6px;border:1px solid #bbf7d0;font-size:12px;">
+                                <strong>Live Connection Status:</strong> <?php echo esc_html($s['stripe_live_last_test']['tested_at']); ?> &middot;
+                                <span style="color:<?php echo !empty($s['stripe_live_last_test']['success']) ? '#15803d' : '#b91c1c'; ?>;font-weight:700;">
+                                    <?php echo !empty($s['stripe_live_last_test']['success']) ? 'SUCCESS' : 'FAILED'; ?>
+                                </span>
+                                <div style="color:#166534;margin-top:2px;"><?php echo esc_html($s['stripe_live_last_test']['message']); ?></div>
+                            </div>
+                        <?php endif; ?>
 
                         <?php if (!empty($s['stripe_test_last_test'])): ?>
-                            <div style="margin-top:16px;padding:12px;background:#f8fafc;border-radius:6px;border:1px solid #e2e8f0;font-size:12px;">
-                                <strong>Last Connection Test:</strong> <?php echo esc_html($s['stripe_test_last_test']['tested_at']); ?> &middot;
+                            <div style="margin-top:8px;padding:10px;background:#f8fafc;border-radius:6px;border:1px solid #e2e8f0;font-size:12px;">
+                                <strong>Test Connection Status:</strong> <?php echo esc_html($s['stripe_test_last_test']['tested_at']); ?> &middot;
                                 <span style="color:<?php echo !empty($s['stripe_test_last_test']['success']) ? '#15803d' : '#b91c1c'; ?>;font-weight:700;">
                                     <?php echo !empty($s['stripe_test_last_test']['success']) ? 'SUCCESS' : 'FAILED'; ?>
                                 </span>
@@ -367,52 +474,150 @@ final class LFA_Admin_Payments {
                             </label>
                         </div>
 
-                        <div style="margin-bottom:16px;">
-                            <label style="font-weight:700;color:#0f172a;margin-right:12px;">Gateway Mode:</label>
-                            <label style="margin-right:16px;">
+                        <div style="margin-bottom:16px;background:#f8fafc;padding:10px 14px;border-radius:6px;border:1px solid #e2e8f0;">
+                            <label style="font-weight:700;color:#0f172a;margin-right:12px;">PayPal Active Mode:</label>
+                            <label style="margin-right:16px;font-weight:600;cursor:pointer;">
                                 <input type="radio" name="paypal_mode" value="sandbox" <?php checked($s['paypal_mode'], 'sandbox'); ?>>
                                 Sandbox
                             </label>
-                            <label>
+                            <label style="font-weight:600;color:#0f172a;cursor:pointer;">
                                 <input type="radio" name="paypal_mode" value="live" <?php checked($s['paypal_mode'], 'live'); ?>>
-                                Live (Production)
+                                <span style="color:#b91c1c;">● Live (Production)</span>
                             </label>
                         </div>
 
-                        <table class="form-table" style="margin:0;">
-                            <tr>
-                                <th scope="row" style="width:140px;padding:10px 0;"><label>Sandbox Client ID</label></th>
-                                <td style="padding:10px 0;">
-                                    <input type="text" name="paypal_sandbox_client_id" value="<?php echo esc_attr($s['paypal_sandbox_client_id']); ?>" class="large-text">
-                                </td>
-                            </tr>
-                            <tr>
-                                <th scope="row" style="padding:10px 0;"><label>Sandbox Secret</label></th>
-                                <td style="padding:10px 0;">
-                                    <div style="margin-bottom:6px;"><?php echo $pp_sb_secret_status; ?></div>
-                                    <input type="password" name="paypal_sandbox_secret" value="" class="large-text" placeholder="Enter new secret to update" autocomplete="new-password">
-                                    <label style="font-size:12px;color:#64748b;display:inline-block;margin-top:4px;">
-                                        <input type="checkbox" name="paypal_sandbox_clear_secret" value="1"> Clear stored Sandbox Secret
-                                    </label>
-                                </td>
-                            </tr>
-                            <tr>
-                                <th scope="row" style="padding:10px 0;"><label>Sandbox Webhook ID</label></th>
-                                <td style="padding:10px 0;">
-                                    <input type="text" name="paypal_sandbox_webhook_id" value="<?php echo esc_attr($s['paypal_sandbox_webhook_id']); ?>" class="large-text">
-                                </td>
-                            </tr>
-                            <tr>
-                                <th scope="row" style="padding:10px 0;"><label>Webhook URL</label></th>
-                                <td style="padding:10px 0;">
-                                    <code style="word-break:break-all;display:block;background:#f1f5f9;padding:8px;border-radius:4px;font-size:12px;"><?php echo esc_html($paypal_webhook_url); ?></code>
-                                </td>
-                            </tr>
-                        </table>
+                        <div style="background:#fef2f2;border:1px solid #fecaca;padding:12px;border-radius:6px;margin-bottom:16px;">
+                            <label style="display:flex;align-items:flex-start;gap:8px;font-size:13px;color:#991b1b;font-weight:600;cursor:pointer;">
+                                <input type="checkbox" name="paypal_live_confirmed" value="1" <?php checked($s['paypal_live_confirmed'] ?? 0, 1); ?> style="margin-top:2px;">
+                                I confirm activation of PayPal Live Production payments with real monetary transactions. (Required only for Live mode — Live also needs “Global Live Payments” switched ON above.)
+                            </label>
+                        </div>
+
+                        <?php
+                        $pp_mode_now = LFA_Gateway_Settings::get_paypal_mode();
+                        $pp_checks = [
+                            'Enabled'                     => (int) $s['paypal_enabled'] === 1,
+                            'Client ID (' . $pp_mode_now . ')' => LFA_Gateway_Settings::get_paypal_client_id($pp_mode_now) !== '',
+                            'Secret decrypts (' . $pp_mode_now . ')' => (bool) LFA_Gateway_Settings::get_paypal_secret($pp_mode_now),
+                            'Webhook ID (' . $pp_mode_now . ')' => LFA_Gateway_Settings::get_paypal_webhook_id($pp_mode_now) !== '',
+                            'Dedicated encryption key in wp-config' => LFA_Gateway_Settings::has_dedicated_key(),
+                        ];
+                        if ($pp_mode_now === 'live') {
+                            $pp_checks['Live confirmed']         = (int) ($s['paypal_live_confirmed'] ?? 0) === 1;
+                            $pp_checks['Global Live Payments ON'] = $global_live;
+                        }
+                        ?>
+                        <div style="margin-bottom:16px;padding:10px 14px;border-radius:6px;border:1px solid <?php echo LFA_Gateway_Settings::is_paypal_enabled() ? '#bbf7d0;background:#f0fdf4' : '#fde68a;background:#fffbeb'; ?>;font-size:12px;">
+                            <strong>Readiness (<?php echo esc_html(strtoupper($pp_mode_now)); ?>):</strong>
+                            <?php echo LFA_Gateway_Settings::is_paypal_enabled() ? '<span style="color:#15803d;font-weight:700;">READY — accepting payments</span>' : '<span style="color:#92400e;font-weight:700;">NOT READY</span>'; ?>
+                            <ul style="margin:6px 0 0;columns:2;">
+                                <?php foreach ($pp_checks as $label => $ok) : ?>
+                                    <li><?php echo $ok ? '✅' : '❌'; ?> <?php echo esc_html($label); ?></li>
+                                <?php endforeach; ?>
+                            </ul>
+                        </div>
+
+                        <!-- PayPal Live Credentials -->
+                        <div style="border:1px solid #e2e8f0;border-radius:6px;padding:14px;margin-bottom:16px;background:#fcfcfd;">
+                            <h4 style="margin:0 0 10px 0;font-size:14px;color:#0f172a;font-weight:700;display:flex;align-items:center;justify-content:space-between;">
+                                <span>Live (Production) Credentials</span>
+                                <span style="font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;">api-m.paypal.com</span>
+                            </h4>
+                            <table class="form-table" style="margin:0;">
+                                <tr>
+                                    <th scope="row" style="width:130px;padding:8px 0;"><label>Live Client ID</label></th>
+                                    <td style="padding:8px 0;">
+                                        <input type="text" name="paypal_live_client_id" value="<?php echo esc_attr($s['paypal_live_client_id'] ?? ''); ?>" class="large-text">
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <th scope="row" style="padding:8px 0;"><label>Live Secret</label></th>
+                                    <td style="padding:8px 0;">
+                                        <div style="margin-bottom:4px;font-size:12px;"><?php echo $pp_live_secret_status; ?></div>
+                                        <input type="password" name="paypal_live_secret" value="" class="large-text" placeholder="Enter new live secret to update" autocomplete="new-password">
+                                        <label style="font-size:12px;color:#64748b;display:inline-block;margin-top:2px;">
+                                            <input type="checkbox" name="paypal_live_clear_secret" value="1"> Clear stored Live Secret
+                                        </label>
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <th scope="row" style="padding:8px 0;"><label>Live Webhook ID</label></th>
+                                    <td style="padding:8px 0;">
+                                        <input type="text" name="paypal_live_webhook_id" value="<?php echo esc_attr($s['paypal_live_webhook_id'] ?? ''); ?>" class="large-text">
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <th scope="row" style="padding:8px 0;"><label>Live Merchant ID</label></th>
+                                    <td style="padding:8px 0;">
+                                        <input type="text" name="paypal_live_merchant_id" value="<?php echo esc_attr($s['paypal_live_merchant_id'] ?? ''); ?>" class="large-text">
+                                    </td>
+                                </tr>
+                            </table>
+                        </div>
+
+                        <!-- PayPal Sandbox Credentials -->
+                        <div style="border:1px solid #e2e8f0;border-radius:6px;padding:14px;margin-bottom:16px;background:#f8fafc;">
+                            <h4 style="margin:0 0 10px 0;font-size:14px;color:#334155;font-weight:700;display:flex;align-items:center;justify-content:space-between;">
+                                <span>Sandbox Credentials</span>
+                                <span style="font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;">api-m.sandbox.paypal.com</span>
+                            </h4>
+                            <table class="form-table" style="margin:0;">
+                                <tr>
+                                    <th scope="row" style="width:130px;padding:8px 0;"><label>Sandbox Client ID</label></th>
+                                    <td style="padding:8px 0;">
+                                        <input type="text" name="paypal_sandbox_client_id" value="<?php echo esc_attr($s['paypal_sandbox_client_id']); ?>" class="large-text">
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <th scope="row" style="padding:8px 0;"><label>Sandbox Secret</label></th>
+                                    <td style="padding:8px 0;">
+                                        <div style="margin-bottom:4px;font-size:12px;"><?php echo $pp_sb_secret_status; ?></div>
+                                        <input type="password" name="paypal_sandbox_secret" value="" class="large-text" placeholder="Enter new secret to update" autocomplete="new-password">
+                                        <label style="font-size:12px;color:#64748b;display:inline-block;margin-top:2px;">
+                                            <input type="checkbox" name="paypal_sandbox_clear_secret" value="1"> Clear stored Sandbox Secret
+                                        </label>
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <th scope="row" style="padding:8px 0;"><label>Sandbox Webhook ID</label></th>
+                                    <td style="padding:8px 0;">
+                                        <input type="text" name="paypal_sandbox_webhook_id" value="<?php echo esc_attr($s['paypal_sandbox_webhook_id']); ?>" class="large-text">
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <th scope="row" style="padding:8px 0;"><label>Sandbox Merchant ID</label></th>
+                                    <td style="padding:8px 0;">
+                                        <input type="text" name="paypal_sandbox_merchant_id" value="<?php echo esc_attr($s['paypal_sandbox_merchant_id'] ?? ''); ?>" class="large-text" placeholder="Auto-filled by “Test Connection”">
+                                    </td>
+                                </tr>
+                            </table>
+                        </div>
+
+                        <!-- Webhook URL Info -->
+                        <div style="padding:10px 12px;background:#f1f5f9;border-radius:6px;font-size:12px;color:#334155;margin-bottom:12px;">
+                            <strong>Public PayPal Webhook Listener URL</strong> (use the same URL for both the Sandbox app and the Live app):
+                            <code style="display:block;background:#ffffff;padding:6px 10px;border-radius:4px;margin-top:4px;word-break:break-all;"><?php echo esc_html($paypal_webhook_url); ?></code>
+                            <div style="margin-top:6px;">Subscribe to these events in the PayPal Developer Dashboard, then paste each app's <em>Webhook ID</em> above:
+                                <code>PAYMENT.CAPTURE.COMPLETED</code>, <code>PAYMENT.CAPTURE.DENIED</code>, <code>PAYMENT.CAPTURE.PENDING</code>, <code>PAYMENT.CAPTURE.REFUNDED</code>, <code>PAYMENT.CAPTURE.REVERSED</code>.
+                            </div>
+                            <?php if (strpos($paypal_webhook_url, 'localhost') !== false || strpos($paypal_webhook_url, 'http://') === 0) : ?>
+                                <div style="margin-top:6px;color:#b45309;font-weight:600;">⚠ This URL is not reachable by PayPal (localhost / non-HTTPS). Webhooks only work on the public HTTPS production domain.</div>
+                            <?php endif; ?>
+                        </div>
+
+                        <?php if (!empty($s['paypal_live_last_test'])): ?>
+                            <div style="margin-top:12px;padding:10px;background:#f0fdf4;border-radius:6px;border:1px solid #bbf7d0;font-size:12px;">
+                                <strong>Live Connection Status:</strong> <?php echo esc_html($s['paypal_live_last_test']['tested_at']); ?> &middot;
+                                <span style="color:<?php echo !empty($s['paypal_live_last_test']['success']) ? '#15803d' : '#b91c1c'; ?>;font-weight:700;">
+                                    <?php echo !empty($s['paypal_live_last_test']['success']) ? 'SUCCESS' : 'FAILED'; ?>
+                                </span>
+                                <div style="color:#166534;margin-top:2px;"><?php echo esc_html($s['paypal_live_last_test']['message']); ?></div>
+                            </div>
+                        <?php endif; ?>
 
                         <?php if (!empty($s['paypal_sandbox_last_test'])): ?>
-                            <div style="margin-top:16px;padding:12px;background:#f8fafc;border-radius:6px;border:1px solid #e2e8f0;font-size:12px;">
-                                <strong>Last Connection Test:</strong> <?php echo esc_html($s['paypal_sandbox_last_test']['tested_at']); ?> &middot;
+                            <div style="margin-top:8px;padding:10px;background:#f8fafc;border-radius:6px;border:1px solid #e2e8f0;font-size:12px;">
+                                <strong>Sandbox Connection Status:</strong> <?php echo esc_html($s['paypal_sandbox_last_test']['tested_at']); ?> &middot;
                                 <span style="color:<?php echo !empty($s['paypal_sandbox_last_test']['success']) ? '#15803d' : '#b91c1c'; ?>;font-weight:700;">
                                     <?php echo !empty($s['paypal_sandbox_last_test']['success']) ? 'SUCCESS' : 'FAILED'; ?>
                                 </span>
@@ -431,14 +636,26 @@ final class LFA_Admin_Payments {
 
             <!-- Diagnostics Action Buttons -->
             <div style="margin-top:32px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:20px;">
-                <h3 style="margin:0 0 12px 0;font-size:15px;color:#0f172a;">Gateway Connection Diagnostics</h3>
-                <div style="display:flex;gap:16px;flex-wrap:wrap;">
+                <h3 style="margin:0 0 12px 0;font-size:15px;color:#0f172a;">Gateway API Connection Diagnostics</h3>
+                <p style="margin:0 0 16px 0;color:#64748b;font-size:13px;">Execute real-time OAuth2 / Secret handshake tests with provider servers without creating real charges.</p>
+                <div style="display:flex;gap:12px;flex-wrap:wrap;">
                     <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
                         <input type="hidden" name="action" value="lfa_test_gateway_connection">
                         <input type="hidden" name="gateway_id" value="stripe">
+                        <input type="hidden" name="test_mode" value="test">
                         <?php wp_nonce_field('lfa_test_gateway_action', 'lfa_test_nonce'); ?>
                         <button type="submit" class="button button-secondary">
-                            ⚡ Test Stripe Test Mode Connection
+                            ⚡ Test Stripe (Test Mode)
+                        </button>
+                    </form>
+
+                    <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+                        <input type="hidden" name="action" value="lfa_test_gateway_connection">
+                        <input type="hidden" name="gateway_id" value="stripe">
+                        <input type="hidden" name="test_mode" value="live">
+                        <?php wp_nonce_field('lfa_test_gateway_action', 'lfa_test_nonce'); ?>
+                        <button type="submit" class="button button-secondary" style="color:#b91c1c;">
+                            ⚡ Test Stripe (Live Mode)
                         </button>
                     </form>
 
@@ -448,7 +665,17 @@ final class LFA_Admin_Payments {
                         <input type="hidden" name="test_mode" value="sandbox">
                         <?php wp_nonce_field('lfa_test_gateway_action', 'lfa_test_nonce'); ?>
                         <button type="submit" class="button button-secondary">
-                            ⚡ Test PayPal Sandbox Connection
+                            ⚡ Test PayPal (Sandbox)
+                        </button>
+                    </form>
+
+                    <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+                        <input type="hidden" name="action" value="lfa_test_gateway_connection">
+                        <input type="hidden" name="gateway_id" value="paypal">
+                        <input type="hidden" name="test_mode" value="live">
+                        <?php wp_nonce_field('lfa_test_gateway_action', 'lfa_test_nonce'); ?>
+                        <button type="submit" class="button button-secondary" style="color:#b91c1c;">
+                            ⚡ Test PayPal (Live Mode)
                         </button>
                     </form>
                 </div>

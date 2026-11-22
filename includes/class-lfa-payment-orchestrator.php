@@ -83,8 +83,8 @@ final class LFA_Payment_Orchestrator {
             return null;
         }
 
-        if (!empty($requested_gateway) && isset($enabled[$requested_gateway])) {
-            return $enabled[$requested_gateway];
+        if (!empty($requested_gateway)) {
+            return $enabled[$requested_gateway] ?? null;
         }
 
         $default_id = LFA_Gateway_Settings::get_default_testing_gateway();
@@ -146,26 +146,29 @@ final class LFA_Payment_Orchestrator {
     public static function get_status_overview(): array {
         $s = LFA_Gateway_Settings::get_settings();
         $paypal_enabled = LFA_Gateway_Settings::is_paypal_enabled();
-        $stripe_enabled = LFA_Gateway_Settings::is_stripe_test_enabled();
+        $stripe_enabled = LFA_Gateway_Settings::is_stripe_enabled();
         $kill_switch    = LFA_Gateway_Settings::is_global_kill_switch_active();
+        $global_live    = LFA_Gateway_Settings::is_global_live_payments_enabled();
+        $stripe_mode    = LFA_Gateway_Settings::get_stripe_mode();
 
         return [
             'kill_switch_active'      => $kill_switch,
+            'global_live_payments'    => $global_live,
             'default_testing_gateway' => $s['default_testing_gateway'],
             'paypal'                  => [
                 'enabled'      => (int)$s['paypal_enabled'] === 1,
                 'ready'        => $paypal_enabled,
                 'mode'         => $s['paypal_mode'],
-                'client_id'    => LFA_Gateway_Settings::mask_key($s['paypal_sandbox_client_id'] ?: $s['paypal_live_client_id']),
+                'client_id'    => LFA_Gateway_Settings::mask_key($s['paypal_mode'] === 'live' ? $s['paypal_live_client_id'] : $s['paypal_sandbox_client_id']),
                 'last_test'    => ($s['paypal_mode'] === 'live' ? $s['paypal_live_last_test'] : $s['paypal_sandbox_last_test']),
             ],
             'stripe'                  => [
                 'enabled'      => (int)$s['stripe_enabled'] === 1,
                 'ready'        => $stripe_enabled,
-                'mode'         => 'test',
-                'pubkey'       => LFA_Gateway_Settings::mask_key(LFA_Gateway_Settings::get_stripe_publishable_key(), 12, 4),
-                'last_test'    => $s['stripe_test_last_test'],
-                'last_webhook' => $s['stripe_test_last_webhook'],
+                'mode'         => $stripe_mode,
+                'pubkey'       => LFA_Gateway_Settings::mask_key(LFA_Gateway_Settings::get_stripe_publishable_key($stripe_mode), 12, 4),
+                'last_test'    => ($stripe_mode === 'live' ? ($s['stripe_live_last_test'] ?? null) : ($s['stripe_test_last_test'] ?? null)),
+                'last_webhook' => ($stripe_mode === 'live' ? ($s['stripe_live_last_webhook'] ?? null) : ($s['stripe_test_last_webhook'] ?? null)),
             ],
         ];
     }

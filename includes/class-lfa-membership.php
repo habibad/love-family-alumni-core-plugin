@@ -45,6 +45,9 @@ final class LFA_Membership {
             wp_schedule_event(time(), 'daily', 'lfa_daily_membership_expiration_check');
         }
         add_action('lfa_daily_membership_expiration_check', [__CLASS__, 'check_all_expirations']);
+
+        // Purge child records automatically when a user is deleted
+        add_action('deleted_user', [__CLASS__, 'on_deleted_user']);
     }
 
     public static function register_capabilities(): void {
@@ -831,5 +834,56 @@ final class LFA_Membership {
         }
 
         return $count;
+    }
+
+    /**
+     * Purge all custom membership, invoice, and payment rows when a WordPress user is deleted.
+     */
+    public static function on_deleted_user(int $user_id): void {
+        if ($user_id <= 0) { return; }
+        global $wpdb;
+        $t_mem  = self::table_memberships();
+        $t_per  = self::table_periods();
+        $t_inv  = self::table_invoices();
+        $t_creg = class_exists('LFA_Conference') ? LFA_Conference::table_registrations() : $wpdb->prefix . 'lfa_conference_registrations';
+        $t_catt = class_exists('LFA_Conference') ? LFA_Conference::table_attendees() : $wpdb->prefix . 'lfa_conference_attendees';
+        $t_cinv = class_exists('LFA_Conference') ? LFA_Conference::table_invoices() : $wpdb->prefix . 'lfa_conference_invoices';
+        $t_cap  = class_exists('LFA_Payment_Service') ? LFA_Payment_Service::table_captures() : $wpdb->prefix . 'lfa_payment_captures';
+        $t_att  = class_exists('LFA_Payment_Service') ? LFA_Payment_Service::table_attempts() : $wpdb->prefix . 'lfa_payment_attempts';
+
+        // Delete conference attendees for user's registrations
+        $reg_ids = $wpdb->get_col($wpdb->prepare("SELECT id FROM {$t_creg} WHERE owner_user_id = %d", $user_id));
+        if (!empty($reg_ids)) {
+            $in_regs = implode(',', array_map('intval', $reg_ids));
+            $wpdb->query("DELETE FROM {$t_catt} WHERE registration_id IN ({$in_regs})");
+        }
+        $wpdb->delete($t_creg, ['owner_user_id' => $user_id]);
+        $wpdb->delete($t_cinv, ['user_id' => $user_id]);
+
+        // Delete membership periods
+        $mem_ids = $wpdb->get_col($wpdb->prepare("SELECT id FROM {$t_mem} WHERE user_id = %d", $user_id));
+        if (!empty($mem_ids)) {
+            $in_mems = implode(',', array_map('intval', $mem_ids));
+            $wpdb->query("DELETE FROM {$t_per} WHERE membership_id IN ({$in_mems})");
+        }
+        // Delete payment captures related to user's payment attempts or invoices
+        $att_ids  = $wpdb->get_col($wpdb->prepare("SELECT id FROM {$t_att} WHERE user_id = %d", $user_id));
+        $inv_ids  = $wpdb->get_col($wpdb->prepare("SELECT id FROM {$t_inv} WHERE user_id = %d", $user_id));
+        $cinv_ids = $wpdb->get_col($wpdb->prepare("SELECT id FROM {$t_cinv} WHERE user_id = %d", $user_id));
+        $all_invs = array_unique(array_filter(array_merge((array) $inv_ids, (array) $cinv_ids)));
+
+        if (!empty($att_ids)) {
+            $in_atts = implode(',', array_map('intval', $att_ids));
+            $wpdb->query("DELETE FROM {$t_cap} WHERE attempt_id IN ({$in_atts})");
+        }
+        if (!empty($all_invs)) {
+            $in_invs = implode(',', array_map('intval', $all_invs));
+            $wpdb->query("DELETE FROM {$t_cap} WHERE invoice_id IN ({$in_invs})");
+        }
+
+        $wpdb->delete($t_mem, ['user_id' => $user_id]);
+        $wpdb->delete($t_att, ['user_id' => $user_id]);
+        $wpdb->delete($t_inv, ['user_id' => $user_id]);
+        $wpdb->delete($t_cinv, ['user_id' => $user_id]);
     }
 }

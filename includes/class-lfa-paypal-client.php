@@ -28,18 +28,19 @@ final class LFA_PayPal_Client {
      */
     public static function get_access_token(?string $mode = null): array {
         $m = $mode ?: LFA_PayPal_Settings::get_mode();
-        $transient_key = "lfa_pp_tok_{$m}";
-
-        $cached = get_transient($transient_key);
-        if (!empty($cached) && is_string($cached)) {
-            return ['success' => true, 'token' => $cached];
-        }
 
         $client_id = LFA_PayPal_Settings::get_client_id($m);
         $secret    = LFA_PayPal_Settings::get_secret($m);
 
         if (empty($client_id) || empty($secret)) {
-            return ['success' => false, 'error' => 'PayPal credentials are not configured for ' . esc_html($m) . ' mode.'];
+            return ['success' => false, 'error' => 'PayPal credentials are not configured (or the stored secret can no longer be decrypted) for ' . esc_html($m) . ' mode. Re-enter the Client Secret in Payment Gateways.'];
+        }
+
+        // Cache key is bound to the exact app credentials, so changing the Client ID never reuses an old token.
+        $transient_key = 'lfa_pp_tok_' . $m . '_' . substr(md5($client_id . '|' . $secret), 0, 12);
+        $cached = get_transient($transient_key);
+        if (!empty($cached) && is_string($cached)) {
+            return ['success' => true, 'token' => $cached];
         }
 
         $base_url = self::get_base_url($m);
@@ -97,6 +98,9 @@ final class LFA_PayPal_Client {
                 'merchant_id'=> null,
             ];
             LFA_PayPal_Settings::record_test_result($m, $result);
+            if (class_exists('LFA_Gateway_Settings')) {
+                LFA_Gateway_Settings::record_test_result('paypal', $m, $result);
+            }
             return $result;
         }
 
@@ -119,6 +123,13 @@ final class LFA_PayPal_Client {
             }
         }
 
+        // Auto-fill the merchant ID for this environment if the admin left it blank.
+        if ($merchant_id && LFA_Gateway_Settings::get_paypal_merchant_id($m) === '') {
+            $gs = LFA_Gateway_Settings::get_settings();
+            $gs["paypal_{$m}_merchant_id"] = $merchant_id;
+            update_option(LFA_Gateway_Settings::OPTION_NAME, $gs, false);
+        }
+
         $result = [
             'success'     => true,
             'message'     => 'Successfully authenticated with PayPal ' . ucfirst($m) . ' API.',
@@ -126,13 +137,16 @@ final class LFA_PayPal_Client {
             'merchant_id' => $merchant_id,
         ];
         LFA_PayPal_Settings::record_test_result($m, $result);
+        if (class_exists('LFA_Gateway_Settings')) {
+            LFA_Gateway_Settings::record_test_result('paypal', $m, $result);
+        }
         return $result;
     }
 
     /**
      * Create PayPal Order (Orders v2) from authoritative local invoice
      */
-    public static function create_order(object $invoice, string $request_id, ?string $mode = null, string $custom_id = '', string $description = ''): array {
+    public static function create_order(object $invoice, string $request_id, ?string $mode = null, string $custom_id = '', string $description = '', string $return_url = '', string $cancel_url = ''): array {
         $m = $mode ?: LFA_PayPal_Settings::get_mode();
         $token_res = self::get_access_token($m);
         if (!$token_res['success']) {
@@ -144,12 +158,27 @@ final class LFA_PayPal_Client {
 
         $cid  = !empty($custom_id) ? $custom_id : "lfa_inv_{$invoice->id}_u_{$invoice->user_id}";
         $desc = !empty($description) ? $description : "Love Family Alumni Annual Dues — Invoice {$invoice->invoice_number}";
+        $ref_id = !empty($invoice->invoice_number) ? (string)$invoice->invoice_number : (!empty($invoice->donation_ref) ? (string)$invoice->donation_ref : (string)$invoice->id);
+
+        $app_context = [
+            'brand_name'          => 'Love Family Alumni',
+            'landing_page'        => 'NO_PREFERENCE',
+            'user_action'         => 'PAY_NOW',
+            'shipping_preference' => 'NO_SHIPPING',
+        ];
+
+        if (!empty($return_url)) {
+            $app_context['return_url'] = $return_url;
+        }
+        if (!empty($cancel_url)) {
+            $app_context['cancel_url'] = $cancel_url;
+        }
 
         $payload = [
             'intent'         => 'CAPTURE',
             'purchase_units' => [
                 [
-                    'reference_id' => (string) $invoice->invoice_number,
+                    'reference_id' => $ref_id,
                     'custom_id'    => $cid,
                     'description'  => $desc,
                     'amount'       => [
@@ -158,12 +187,7 @@ final class LFA_PayPal_Client {
                     ],
                 ],
             ],
-            'application_context' => [
-                'brand_name'          => 'Love Family Alumni',
-                'landing_page'        => 'NO_PREFERENCE',
-                'user_action'         => 'PAY_NOW',
-                'shipping_preference' => 'NO_SHIPPING',
-            ],
+            'application_context' => $app_context,
         ];
 
         $response = wp_remote_post("{$base_url}/v2/checkout/orders", [
@@ -185,15 +209,28 @@ final class LFA_PayPal_Client {
         $body = json_decode(wp_remote_retrieve_body($response), true);
 
         if ($code !== 201 && $code !== 200) {
-            $msg = !empty($body['message']) ? $body['message'] : "HTTP {$code}";
-            return ['success' => false, 'error' => 'PayPal create order failed: ' . sanitize_text_field($msg)];
+            $err = self::describe_error($body, $code);
+            return ['success' => false, 'error' => 'PayPal create order failed: ' . $err['text'], 'issue' => $err['issue'], 'code' => $code];
+        }
+
+        $approve_url = '';
+        if (!empty($body['links']) && is_array($body['links'])) {
+            foreach ($body['links'] as $link) {
+                if (isset($link['rel']) && $link['rel'] === 'approve') {
+                    $approve_url = (string) $link['href'];
+                    break;
+                }
+            }
         }
 
         return [
-            'success'  => true,
-            'order_id' => (string) $body['id'],
-            'status'   => (string) $body['status'],
-            'raw'      => $body,
+            'success'      => true,
+            'order_id'     => (string) $body['id'],
+            'status'       => (string) $body['status'],
+            'approve_url'  => $approve_url,
+            'checkout_url' => $approve_url,
+            'session_url'  => $approve_url,
+            'raw'          => $body,
         ];
     }
 
@@ -208,7 +245,7 @@ final class LFA_PayPal_Client {
         }
 
         $base_url = self::get_base_url($m);
-        $endpoint = "{$base_url}/v2/checkout/orders/{$order_id}/capture";
+        $endpoint = "{$base_url}/v2/checkout/orders/" . rawurlencode($order_id) . '/capture';
 
         $response = wp_remote_post($endpoint, [
             'timeout' => self::TIMEOUT,
@@ -229,35 +266,54 @@ final class LFA_PayPal_Client {
         $body = json_decode(wp_remote_retrieve_body($response), true);
 
         if ($code !== 201 && $code !== 200) {
-            $msg = !empty($body['message']) ? $body['message'] : "HTTP {$code}";
-            return ['success' => false, 'error' => 'PayPal capture API error: ' . sanitize_text_field($msg), 'code' => $code];
+            $err = self::describe_error($body, $code);
+            return ['success' => false, 'error' => 'PayPal capture API error: ' . $err['text'], 'issue' => $err['issue'], 'code' => $code];
         }
 
-        // Extract capture details from purchase_units[0].payments.captures[0]
-        $capture_data = null;
-        if (!empty($body['purchase_units'][0]['payments']['captures'][0])) {
-            $capture_data = $body['purchase_units'][0]['payments']['captures'][0];
-        }
+        return self::extract_capture_from_order(is_array($body) ? $body : [], $order_id);
+    }
 
+    /**
+     * Pull the first capture out of an Orders v2 representation (capture response or GET order).
+     */
+    public static function extract_capture_from_order(array $order, string $order_id = ''): array {
+        $capture_data = $order['purchase_units'][0]['payments']['captures'][0] ?? null;
         if (!$capture_data || empty($capture_data['id'])) {
-            return ['success' => false, 'error' => 'PayPal capture response did not contain capture details.'];
+            return ['success' => false, 'error' => 'PayPal response did not contain capture details.', 'issue' => 'NO_CAPTURE'];
         }
 
         $captured_cents = isset($capture_data['amount']['value']) ? (int) round(((float)$capture_data['amount']['value']) * 100) : 0;
-        $captured_curr  = isset($capture_data['amount']['currency_code']) ? (string)$capture_data['amount']['currency_code'] : 'USD';
-        $payee_merchant = isset($capture_data['payee']['merchant_id']) ? (string)$capture_data['payee']['merchant_id'] : '';
+        $captured_curr  = isset($capture_data['amount']['currency_code']) ? (string)$capture_data['amount']['currency_code'] : '';
+        $payee_merchant = (string) ($capture_data['payee']['merchant_id'] ?? ($order['purchase_units'][0]['payee']['merchant_id'] ?? ''));
 
         return [
             'success'           => true,
-            'order_id'          => $order_id,
+            'order_id'          => $order_id ?: (string) ($order['id'] ?? ''),
             'capture_id'        => (string) $capture_data['id'],
-            'capture_status'    => (string) $capture_data['status'],
+            'capture_status'    => (string) ($capture_data['status'] ?? ''),
             'amount_cents'      => $captured_cents,
             'currency'          => $captured_curr,
             'payee_merchant_id' => $payee_merchant,
+            'custom_id'         => (string) ($capture_data['custom_id'] ?? ($order['purchase_units'][0]['custom_id'] ?? '')),
             'captured_at'       => !empty($capture_data['create_time']) ? gmdate('Y-m-d H:i:s', strtotime($capture_data['create_time'])) : current_time('mysql', true),
             'raw'               => $capture_data,
         ];
+    }
+
+    /**
+     * Human-readable PayPal error including the machine issue code and debug_id.
+     *
+     * @return array{text:string,issue:string}
+     */
+    public static function describe_error($body, int $code): array {
+        $body  = is_array($body) ? $body : [];
+        $issue = (string) ($body['details'][0]['issue'] ?? ($body['name'] ?? ''));
+        $desc  = (string) ($body['details'][0]['description'] ?? ($body['message'] ?? "HTTP {$code}"));
+        $text  = $issue !== '' ? "{$issue} — {$desc}" : $desc;
+        if (!empty($body['debug_id'])) {
+            $text .= ' (debug_id ' . $body['debug_id'] . ')';
+        }
+        return ['text' => sanitize_text_field($text), 'issue' => sanitize_text_field($issue)];
     }
 
     /**
@@ -271,7 +327,7 @@ final class LFA_PayPal_Client {
         }
 
         $base_url = self::get_base_url($m);
-        $response = wp_remote_get("{$base_url}/v2/checkout/orders/{$order_id}", [
+        $response = wp_remote_get("{$base_url}/v2/checkout/orders/" . rawurlencode($order_id), [
             'timeout' => self::TIMEOUT,
             'headers' => [
                 'Authorization' => "Bearer {$token_res['token']}",
@@ -304,7 +360,7 @@ final class LFA_PayPal_Client {
         }
 
         $base_url = self::get_base_url($m);
-        $response = wp_remote_get("{$base_url}/v2/payments/captures/{$capture_id}", [
+        $response = wp_remote_get("{$base_url}/v2/payments/captures/" . rawurlencode($capture_id), [
             'timeout' => self::TIMEOUT,
             'headers' => [
                 'Authorization' => "Bearer {$token_res['token']}",
@@ -364,15 +420,18 @@ final class LFA_PayPal_Client {
         }
 
         $base_url = self::get_base_url($m);
-        $verify_payload = [
+
+        // Embed the RAW body verbatim: re-encoding decoded JSON can change bytes
+        // (e.g. {} → [], number formatting) and cause false verification failures.
+        $meta = (string) json_encode([
             'auth_algo'         => $auth_algo,
             'cert_url'          => $cert_url,
             'transmission_id'   => $transmission_id,
             'transmission_sig'  => $transmission_sig,
             'transmission_time' => $transmission_time,
             'webhook_id'        => $webhook_id,
-            'webhook_event'     => $event_json,
-        ];
+        ], JSON_UNESCAPED_SLASHES);
+        $verify_body = substr($meta, 0, -1) . ',"webhook_event":' . trim($raw_body) . '}';
 
         $response = wp_remote_post("{$base_url}/v1/notifications/verify-webhook-signature", [
             'timeout' => self::TIMEOUT,
@@ -380,7 +439,7 @@ final class LFA_PayPal_Client {
                 'Authorization' => "Bearer {$token_res['token']}",
                 'Content-Type'  => 'application/json',
             ],
-            'body'    => (string) json_encode($verify_payload),
+            'body'    => $verify_body,
         ]);
 
         if (is_wp_error($response)) {

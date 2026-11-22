@@ -103,6 +103,7 @@ final class LFA_News_Admin {
                 <thead>
                     <tr>
                         <th style="width: 40px;">ID</th>
+                        <th style="width: 65px;">Image</th>
                         <th>Article Title / Slug</th>
                         <th>Category</th>
                         <th>Consent Status</th>
@@ -114,12 +115,21 @@ final class LFA_News_Admin {
                 </thead>
                 <tbody>
                     <?php if (empty($stories)): ?>
-                        <tr><td colspan="8">No articles found in this view.</td></tr>
+                        <tr><td colspan="9">No articles found in this view.</td></tr>
                     <?php else: foreach ($stories as $p):
                         $item = LFA_News::format_news_item($p);
+                        $t_id = get_post_thumbnail_id($p->ID);
+                        $t_src = $t_id ? wp_get_attachment_image_url($t_id, 'thumbnail') : '';
                         ?>
                         <tr>
                             <td>#<?php echo esc_html($p->ID); ?></td>
+                            <td>
+                                <?php if ($t_src): ?>
+                                    <img src="<?php echo esc_url($t_src); ?>" alt="" style="width:50px; height:38px; object-fit:cover; border-radius:4px; border:1px solid #ddd;">
+                                <?php else: ?>
+                                    <span style="display:inline-block; width:50px; height:38px; background:#f0f2f5; border-radius:4px; border:1px dashed #ccd0d4; text-align:center; line-height:38px; color:#999; font-size:10px;">No Img</span>
+                                <?php endif; ?>
+                            </td>
                             <td>
                                 <strong><a href="<?php echo esc_url(admin_url('admin.php?page=lfa-news-edit&story_id=' . $p->ID)); ?>"><?php echo esc_html($p->post_title); ?></a></strong><br>
                                 <code><?php echo esc_html($p->post_name); ?></code>
@@ -218,6 +228,10 @@ final class LFA_News_Admin {
         $current_cat = !empty($terms) ? $terms[0]->slug : 'general';
 
         $all_categories = get_terms(['taxonomy' => LFA_News::TAXONOMY, 'hide_empty' => false]);
+
+        wp_enqueue_media();
+        $thumb_id  = $post ? get_post_thumbnail_id($post->ID) : 0;
+        $thumb_url = $thumb_id ? wp_get_attachment_image_url($thumb_id, 'medium_large') : '';
         ?>
         <div class="wrap">
             <h1><?php echo $post ? 'Edit Story: ' . esc_html($post->post_title) : 'Write New Article / Announcement'; ?></h1>
@@ -278,6 +292,57 @@ final class LFA_News_Admin {
                         </label>
                     </p>
                 </div>
+
+                <!-- Featured Image Selector (Fully Dynamic via WP Media Library) -->
+                <div class="card" style="padding: 20px; margin-bottom: 20px;">
+                    <h2>Featured Image / Cover Photo</h2>
+                    <p class="description">Upload or select an image from the media library to display on the news grid, article header, and cards.</p>
+                    <div style="margin-top: 15px;">
+                        <input type="hidden" name="featured_image_id" id="lfa_news_image_id" value="<?php echo esc_attr($thumb_id); ?>">
+                        <div id="lfa_news_image_preview_wrap" style="margin-bottom: 15px; <?php echo empty($thumb_url) ? 'display:none;' : ''; ?>">
+                            <img id="lfa_news_image_preview" src="<?php echo esc_url($thumb_url); ?>" alt="Preview" style="max-width: 380px; max-height: 240px; border-radius: 8px; border: 1px solid #ccd0d4; display: block; object-fit: cover;">
+                        </div>
+                        <button type="button" class="button button-secondary button-large" id="lfa_news_upload_btn">
+                            <?php echo $thumb_url ? 'Change Featured Image' : 'Select Featured Image'; ?>
+                        </button>
+                        <button type="button" class="button button-link-delete" id="lfa_news_remove_btn" style="<?php echo empty($thumb_url) ? 'display:none;' : ''; ?> margin-left: 10px;">
+                            Remove Image
+                        </button>
+                    </div>
+                </div>
+
+                <script>
+                jQuery(document).ready(function($) {
+                    var mediaFrame;
+                    $('#lfa_news_upload_btn').on('click', function(e) {
+                        e.preventDefault();
+                        if (mediaFrame) { mediaFrame.open(); return; }
+                        mediaFrame = wp.media({
+                            title: 'Select or Upload News Featured Image',
+                            button: { text: 'Set Featured Image' },
+                            multiple: false
+                        });
+                        mediaFrame.on('select', function() {
+                            var attachment = mediaFrame.state().get('selection').first().toJSON();
+                            $('#lfa_news_image_id').val(attachment.id);
+                            var url = (attachment.sizes && attachment.sizes.medium_large) ? attachment.sizes.medium_large.url : attachment.url;
+                            $('#lfa_news_image_preview').attr('src', url);
+                            $('#lfa_news_image_preview_wrap').show();
+                            $('#lfa_news_remove_btn').show();
+                            $('#lfa_news_upload_btn').text('Change Featured Image');
+                        });
+                        mediaFrame.open();
+                    });
+                    $('#lfa_news_remove_btn').on('click', function(e) {
+                        e.preventDefault();
+                        $('#lfa_news_image_id').val('');
+                        $('#lfa_news_image_preview').attr('src', '');
+                        $('#lfa_news_image_preview_wrap').hide();
+                        $(this).hide();
+                        $('#lfa_news_upload_btn').text('Select Featured Image');
+                    });
+                });
+                </script>
 
                 <div class="card" style="padding: 20px; margin-bottom: 20px; border-left: 4px solid #c6953d;">
                     <h2>Privacy, Consent & Authorization Gate (NEW-010, NEW-011)</h2>
@@ -402,6 +467,16 @@ final class LFA_News_Admin {
             update_post_meta($story_id, '_lfa_news_consent_notes', $consent_ref);
             update_post_meta($story_id, '_lfa_news_featured', $is_featured);
             update_post_meta($story_id, '_lfa_news_status', $target_status);
+
+            // Handle Dynamic Featured Image
+            if (isset($_POST['featured_image_id'])) {
+                $feat_img_id = (int)$_POST['featured_image_id'];
+                if ($feat_img_id > 0) {
+                    set_post_thumbnail($story_id, $feat_img_id);
+                } else {
+                    delete_post_thumbnail($story_id);
+                }
+            }
 
             if (class_exists('LFA_Content_Audit')) {
                 LFA_Content_Audit::log('staff', $user_id, $action, 'news', (string)$story_id, [

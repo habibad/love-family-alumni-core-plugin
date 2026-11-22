@@ -26,30 +26,43 @@ final class LFA_Stripe_Gateway implements LFA_Payment_Gateway_Interface {
      * Get human-readable title
      */
     public function get_title(): string {
-        return 'Stripe (Test Mode)';
+        return LFA_Gateway_Settings::get_stripe_mode() === 'live'
+            ? 'Stripe (Credit / Debit Card)'
+            : 'Stripe (Test Mode)';
     }
 
     /**
-     * Check if Stripe Test gateway is enabled
+     * Check if Stripe gateway is enabled
      */
     public function is_enabled(): bool {
-        return LFA_Gateway_Settings::is_stripe_test_enabled();
+        return LFA_Gateway_Settings::is_stripe_enabled();
     }
 
     /**
-     * Environment is fixed to test in this development scope
+     * Environment is resolved from active settings ('test' or 'live')
      */
     public function get_environment(): string {
-        return 'test';
+        return LFA_Gateway_Settings::get_stripe_mode();
     }
 
     /**
      * Get initialized StripeClient instance
      */
-    public static function get_client(): ?\Stripe\StripeClient {
-        $secret = LFA_Gateway_Settings::get_stripe_secret_key();
-        if (empty($secret) || !str_starts_with($secret, 'sk_test_')) {
+    public static function get_client(?string $mode = null): ?\Stripe\StripeClient {
+        $m = $mode ?: LFA_Gateway_Settings::get_stripe_mode();
+        $secret = LFA_Gateway_Settings::get_stripe_secret_key($m);
+        if (empty($secret)) {
             return null;
+        }
+
+        if ($m === 'live') {
+            if (!str_starts_with($secret, 'sk_live_')) {
+                return null;
+            }
+        } else {
+            if (!str_starts_with($secret, 'sk_test_')) {
+                return null;
+            }
         }
 
         if (!class_exists('\Stripe\StripeClient')) {
@@ -70,27 +83,40 @@ final class LFA_Stripe_Gateway implements LFA_Payment_Gateway_Interface {
     }
 
     /**
-     * Test connection to Stripe Test API
+     * Test connection to Stripe API (Test or Live mode)
      */
-    public function test_connection(): array {
-        $secret = LFA_Gateway_Settings::get_stripe_secret_key();
-        $pubkey = LFA_Gateway_Settings::get_stripe_publishable_key();
+    public function test_connection(?string $mode = null): array {
+        $m = $mode ?: LFA_Gateway_Settings::get_stripe_mode();
+        $secret = LFA_Gateway_Settings::get_stripe_secret_key($m);
+        $pubkey = LFA_Gateway_Settings::get_stripe_publishable_key($m);
+        $label = ($m === 'live') ? 'Stripe Live (Production)' : 'Stripe Test';
 
         if (empty($secret) || empty($pubkey)) {
             $result = [
                 'success'   => false,
-                'message'   => 'Stripe Test Publishable Key and Secret Key must both be configured.',
+                'message'   => "{$label} Publishable Key and Secret Key must both be configured.",
                 'tested_at' => current_time('mysql', true),
                 'account'   => null,
             ];
-            LFA_Gateway_Settings::record_test_result('stripe', 'test', $result);
+            LFA_Gateway_Settings::record_test_result('stripe', $m, $result);
             return $result;
         }
 
-        if (!str_starts_with($secret, 'sk_test_')) {
+        if ($m === 'live' && !str_starts_with($secret, 'sk_live_')) {
             $result = [
                 'success'   => false,
-                'message'   => 'Security Violation: Only Stripe Test credentials (sk_test_...) are permitted.',
+                'message'   => 'Invalid Live Secret Key: Key must begin with sk_live_.',
+                'tested_at' => current_time('mysql', true),
+                'account'   => null,
+            ];
+            LFA_Gateway_Settings::record_test_result('stripe', 'live', $result);
+            return $result;
+        }
+
+        if ($m === 'test' && !str_starts_with($secret, 'sk_test_')) {
+            $result = [
+                'success'   => false,
+                'message'   => 'Invalid Test Secret Key: Key must begin with sk_test_.',
                 'tested_at' => current_time('mysql', true),
                 'account'   => null,
             ];
@@ -98,7 +124,7 @@ final class LFA_Stripe_Gateway implements LFA_Payment_Gateway_Interface {
             return $result;
         }
 
-        $client = self::get_client();
+        $client = self::get_client($m);
         if (!$client) {
             $result = [
                 'success'   => false,
@@ -106,7 +132,7 @@ final class LFA_Stripe_Gateway implements LFA_Payment_Gateway_Interface {
                 'tested_at' => current_time('mysql', true),
                 'account'   => null,
             ];
-            LFA_Gateway_Settings::record_test_result('stripe', 'test', $result);
+            LFA_Gateway_Settings::record_test_result('stripe', $m, $result);
             return $result;
         }
 
@@ -114,37 +140,49 @@ final class LFA_Stripe_Gateway implements LFA_Payment_Gateway_Interface {
             // Ping Stripe Balance / Account API
             $bal = $client->balance->retrieve();
             $account_id = null;
-            $account_name = 'Stripe Test Account';
+            $account_name = ($m === 'live') ? 'Stripe Production Account' : 'Stripe Test Account';
+
+            // Verify livemode match
+            $is_live_bal = !empty($bal->livemode);
+            if ($m === 'live' && !$is_live_bal) {
+                $result = [
+                    'success'   => false,
+                    'message'   => 'Environment Mismatch: Live mode was tested but returned test balance credentials.',
+                    'tested_at' => current_time('mysql', true),
+                    'account'   => null,
+                ];
+                LFA_Gateway_Settings::record_test_result('stripe', $m, $result);
+                return $result;
+            }
 
             try {
                 $acc = $client->accounts->retrieve(null);
                 if (!empty($acc->id)) {
                     $account_id = $acc->id;
-                    $account_name = $acc->business_profile->name ?? ($acc->settings->dashboard->display_name ?? 'Stripe Test Account');
+                    $account_name = $acc->business_profile->name ?? ($acc->settings->dashboard->display_name ?? $account_name);
                 }
             } catch (\Exception $e) {
-                // Balance retrieve already confirmed API key validity
-                $account_id = 'test_verified';
+                $account_id = ($m === 'live') ? 'live_verified' : 'test_verified';
             }
 
             $result = [
                 'success'      => true,
-                'message'      => 'Successfully connected to Stripe Test API. Ready for test checkouts.',
+                'message'      => "Successfully connected to {$label} API. Ready for checkouts.",
                 'tested_at'    => current_time('mysql', true),
                 'account_id'   => $account_id,
                 'account_name' => $account_name,
                 'livemode'     => $bal->livemode ?? false,
             ];
-            LFA_Gateway_Settings::record_test_result('stripe', 'test', $result);
+            LFA_Gateway_Settings::record_test_result('stripe', $m, $result);
             return $result;
         } catch (\Stripe\Exception\ApiErrorException $e) {
             $result = [
                 'success'   => false,
-                'message'   => 'Stripe API Authentication Failed: ' . $e->getMessage(),
+                'message'   => "{$label} API Authentication Failed: " . $e->getMessage(),
                 'tested_at' => current_time('mysql', true),
                 'account'   => null,
             ];
-            LFA_Gateway_Settings::record_test_result('stripe', 'test', $result);
+            LFA_Gateway_Settings::record_test_result('stripe', $m, $result);
             return $result;
         } catch (\Throwable $e) {
             $result = [
@@ -153,7 +191,7 @@ final class LFA_Stripe_Gateway implements LFA_Payment_Gateway_Interface {
                 'tested_at' => current_time('mysql', true),
                 'account'   => null,
             ];
-            LFA_Gateway_Settings::record_test_result('stripe', 'test', $result);
+            LFA_Gateway_Settings::record_test_result('stripe', $m, $result);
             return $result;
         }
     }
@@ -231,14 +269,18 @@ final class LFA_Stripe_Gateway implements LFA_Payment_Gateway_Interface {
 
         // Record initialized attempt in local database
         $now = current_time('mysql', true);
+        $active_env = $this->get_environment();
+        $is_live = ($active_env === 'live');
+        $merchant_name = $is_live ? 'Stripe Production' : 'Stripe Test';
+
         $wpdb->insert($t_att, [
             'invoice_id'          => $invoice_id,
             'payable_type'        => $payable_type,
             'payable_id'          => $invoice_id,
             'user_id'             => $user_id,
             'provider'            => 'stripe',
-            'mode'                => 'test',
-            'merchant_identity'   => 'Stripe Test',
+            'mode'                => $active_env,
+            'merchant_identity'   => $merchant_name,
             'local_request_key'   => $local_request_key,
             'order_id'            => null,
             'amount_cents'        => $amount_cents,
@@ -252,10 +294,11 @@ final class LFA_Stripe_Gateway implements LFA_Payment_Gateway_Interface {
         // Compose Line Item and Metadata based on Payable Type
         $user_obj = get_user_by('id', $user_id);
         $customer_email = $user_obj ? $user_obj->user_email : '';
+        $mode_suffix = $is_live ? '' : ' [TEST MODE]';
 
         if ($payable_type === 'donation') {
             $item_title = "Donation: {$payable->purpose_snapshot}";
-            $item_desc  = "Love Family Alumni Giving — Ref {$payable->donation_ref} [TEST MODE]";
+            $item_desc  = "Love Family Alumni Giving — Ref {$payable->donation_ref}{$mode_suffix}";
             $ref_num    = $payable->donation_ref;
             if (!empty($payable->donor_email)) {
                 $customer_email = $payable->donor_email;
@@ -266,13 +309,13 @@ final class LFA_Stripe_Gateway implements LFA_Payment_Gateway_Interface {
             $reg = $check['registration'] ?? null;
             $ticket_name = $reg ? $reg->ticket_name_snapshot : 'Conference Pass';
             $item_title  = "2027 Conference Pass: {$ticket_name}";
-            $item_desc   = "Love Family Alumni Biennial Conference 2027 — Invoice {$payable->invoice_number} [TEST MODE]";
+            $item_desc   = "Love Family Alumni Biennial Conference 2027 — Invoice {$payable->invoice_number}{$mode_suffix}";
             $ref_num     = $payable->invoice_number;
             $success_url = home_url("/member-dashboard/?payment_session_id={CHECKOUT_SESSION_ID}&session_id={CHECKOUT_SESSION_ID}&gateway=stripe&context=conference#conference");
             $cancel_url  = home_url("/member-dashboard/?payment_cancelled=1#conference");
         } else {
             $item_title  = "Annual Membership Dues (2026/2027)";
-            $item_desc   = "Love Family Alumni North America — Invoice {$payable->invoice_number} [TEST MODE]";
+            $item_desc   = "Love Family Alumni North America — Invoice {$payable->invoice_number}{$mode_suffix}";
             $ref_num     = $payable->invoice_number;
             $success_url = home_url("/member-dashboard/?payment_session_id={CHECKOUT_SESSION_ID}&session_id={CHECKOUT_SESSION_ID}&gateway=stripe&context=dues#dues");
             $cancel_url  = home_url("/member-dashboard/?payment_cancelled=1#dues");
@@ -297,14 +340,14 @@ final class LFA_Stripe_Gateway implements LFA_Payment_Gateway_Interface {
             'client_reference_id'  => "lfa_{$payable_type}_{$invoice_id}_{$user_id}",
             'metadata'             => [
                 'gateway_provider' => 'stripe',
-                'environment'      => 'test',
+                'environment'      => $active_env,
                 'payable_type'     => $payable_type,
                 'invoice_id'       => (string) $invoice_id,
                 'payable_id'       => (string) $invoice_id,
                 'user_id'          => (string) $user_id,
                 'invoice_number'   => (string) $ref_num,
                 'attempt_id'       => (string) $attempt_id,
-                'test_transaction' => '1',
+                'test_transaction' => $is_live ? '0' : '1',
             ],
             'success_url'          => $success_url,
             'cancel_url'           => $cancel_url,
@@ -402,9 +445,13 @@ final class LFA_Stripe_Gateway implements LFA_Payment_Gateway_Interface {
      * Verify Stripe webhook signature using official SDK
      */
     public function verify_webhook(array $headers, string $raw_body): array {
-        $signing_secret = LFA_Gateway_Settings::get_stripe_webhook_secret();
-        if (empty($signing_secret)) {
-            return ['verified' => false, 'error' => 'Stripe Test Webhook Signing Secret is not configured.'];
+        $active_mode = LFA_Gateway_Settings::get_stripe_mode();
+        $signing_secret = LFA_Gateway_Settings::get_stripe_webhook_secret($active_mode);
+        $alt_mode = ($active_mode === 'live') ? 'test' : 'live';
+        $alt_secret = LFA_Gateway_Settings::get_stripe_webhook_secret($alt_mode);
+
+        if (empty($signing_secret) && empty($alt_secret)) {
+            return ['verified' => false, 'error' => 'Stripe Webhook Signing Secret is not configured.'];
         }
 
         // Clean headers: look for Stripe-Signature
@@ -420,17 +467,40 @@ final class LFA_Stripe_Gateway implements LFA_Payment_Gateway_Interface {
             return ['verified' => false, 'error' => 'Missing Stripe-Signature header.'];
         }
 
-        try {
-            // Use official Stripe Webhook signature verification
-            $event = \Stripe\Webhook::constructEvent($raw_body, $sig_header, $signing_secret);
-            return ['verified' => true, 'event' => $event];
-        } catch (\Stripe\Exception\SignatureVerificationException $e) {
-            return ['verified' => false, 'error' => 'Stripe Webhook Signature Verification Failed: ' . $e->getMessage()];
-        } catch (\UnexpectedValueException $e) {
-            return ['verified' => false, 'error' => 'Invalid Webhook Payload JSON: ' . $e->getMessage()];
-        } catch (\Throwable $e) {
-            return ['verified' => false, 'error' => 'Webhook Verification Exception: ' . $e->getMessage()];
+        // Try primary signing secret
+        if (!empty($signing_secret)) {
+            try {
+                $event = \Stripe\Webhook::constructEvent($raw_body, $sig_header, $signing_secret);
+                return ['verified' => true, 'event' => $event, 'mode' => $active_mode];
+            } catch (\Stripe\Exception\SignatureVerificationException $e) {
+                // Try fallback secret if available
+                if (!empty($alt_secret)) {
+                    try {
+                        $event = \Stripe\Webhook::constructEvent($raw_body, $sig_header, $alt_secret);
+                        return ['verified' => true, 'event' => $event, 'mode' => $alt_mode];
+                    } catch (\Exception $alt_e) {
+                        return ['verified' => false, 'error' => 'Stripe Webhook Signature Verification Failed: ' . $e->getMessage()];
+                    }
+                }
+                return ['verified' => false, 'error' => 'Stripe Webhook Signature Verification Failed: ' . $e->getMessage()];
+            } catch (\UnexpectedValueException $e) {
+                return ['verified' => false, 'error' => 'Invalid Webhook Payload JSON: ' . $e->getMessage()];
+            } catch (\Throwable $e) {
+                return ['verified' => false, 'error' => 'Webhook Verification Exception: ' . $e->getMessage()];
+            }
         }
+
+        // Fallback secret only
+        if (!empty($alt_secret)) {
+            try {
+                $event = \Stripe\Webhook::constructEvent($raw_body, $sig_header, $alt_secret);
+                return ['verified' => true, 'event' => $event, 'mode' => $alt_mode];
+            } catch (\Exception $e) {
+                return ['verified' => false, 'error' => 'Stripe Webhook Signature Verification Failed: ' . $e->getMessage()];
+            }
+        }
+
+        return ['verified' => false, 'error' => 'No valid signing secret configured.'];
     }
 
     /**
