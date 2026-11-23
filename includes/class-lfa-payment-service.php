@@ -481,6 +481,7 @@ final class LFA_Payment_Service {
         }
 
         // If billing cycle is unconfigured and period dates are missing, block checkout per policy (P4-004)
+        $policy = LFA_Membership::get_policy();
         if (($policy['billing_cycle'] === 'unconfigured' || empty($policy['billing_cycle'])) && empty($period->starts_at)) {
             return [
                 'valid' => false,
@@ -511,6 +512,51 @@ final class LFA_Payment_Service {
     }
 
     /**
+     * Build PayPal order context (custom_id, description, return/cancel URLs) for a payable.
+     */
+    private static function build_order_context(string $payable_type, object $invoice, int $user_id, array $check): array {
+        if ($payable_type === 'donation') {
+            $ref = rawurlencode((string) $invoice->donation_ref);
+            return [
+                'custom_id'  => "lfa_don_{$invoice->id}_u_{$user_id}",
+                'desc'       => "Love Family Alumni Giving — Ref {$invoice->donation_ref} ({$invoice->purpose_snapshot})",
+                'return_url' => home_url("/give/?gateway=paypal&context=donation&ref={$ref}"),
+                'cancel_url' => home_url("/give/?payment_cancelled=1&gateway=paypal&ref={$ref}"),
+            ];
+        }
+        if ($payable_type === 'conference') {
+            $reg   = $check['registration'] ?? null;
+            $conf  = $reg && class_exists('LFA_Conference') ? LFA_Conference::get_conference_by_id((int) $reg->conference_id) : null;
+            $title = $conf ? $conf->title : 'Conference';
+            $tier  = $reg ? $reg->ticket_name_snapshot : 'Conference Pass';
+            return [
+                'custom_id'  => "lfa_conf_inv_{$invoice->id}_u_{$user_id}",
+                'desc'       => mb_substr("{$title} — {$tier} — Invoice {$invoice->invoice_number}", 0, 127),
+                'return_url' => home_url('/member-dashboard/?gateway=paypal&context=conference#conference'),
+                'cancel_url' => home_url('/member-dashboard/?payment_cancelled=1&gateway=paypal&context=conference#conference'),
+            ];
+        }
+        return [
+            'custom_id'  => "lfa_inv_{$invoice->id}_u_{$user_id}",
+            'desc'       => "Love Family Alumni Annual Dues — Invoice {$invoice->invoice_number}",
+            'return_url' => home_url('/member-dashboard/?gateway=paypal&context=dues#dues'),
+            'cancel_url' => home_url('/member-dashboard/?payment_cancelled=1&gateway=paypal&context=dues#dues'),
+        ];
+    }
+
+    /**
+     * Approve / payer-action link from an Orders v2 representation.
+     */
+    private static function find_approve_link(array $order): string {
+        foreach (($order['links'] ?? []) as $link) {
+            if (in_array($link['rel'] ?? '', ['approve', 'payer-action'], true)) {
+                return (string) $link['href'];
+            }
+        }
+        return '';
+    }
+
+    /**
      * Create PayPal Order from authoritative local invoice
      */
     public static function create_order(int $invoice_id, int $user_id, string $request_key = '', string $payable_type = 'membership_due'): array {
@@ -522,28 +568,48 @@ final class LFA_Payment_Service {
         $invoice = $check['invoice'];
         global $wpdb;
         $t_att = self::table_attempts();
-        $mode = LFA_PayPal_Settings::get_mode();
+        $mode  = LFA_PayPal_Settings::get_mode();
+        $ctx   = self::build_order_context($payable_type, $invoice, $user_id, $check);
 
-        // Idempotency: check if an existing pending attempt exists for this user and invoice and payable_type
-        $local_key = !empty($request_key) ? sanitize_text_field($request_key) : wp_generate_uuid4();
+        // Reuse a recent unpaid order for the same payable/amount/environment (prevents duplicate orders on re-click).
+        // NOTE: timestamps are stored in UTC, so compare against UTC_TIMESTAMP() (not NOW()).
         $existing = $wpdb->get_row($wpdb->prepare(
-            "SELECT * FROM {$t_att} WHERE (payable_id = %d OR invoice_id = %d) AND payable_type = %s AND user_id = %d AND state = 'order_created' AND updated_at > DATE_SUB(NOW(), INTERVAL 2 HOUR) ORDER BY id DESC LIMIT 1",
-            $invoice_id,
-            $invoice_id,
-            $payable_type,
-            $user_id
+            "SELECT * FROM {$t_att}
+             WHERE provider = 'paypal' AND payable_type = %s AND payable_id = %d AND user_id = %d
+               AND mode = %s AND amount_cents = %d AND state = 'order_created' AND order_id IS NOT NULL
+               AND updated_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL 3 HOUR)
+             ORDER BY id DESC LIMIT 1",
+            $payable_type, $invoice_id, $user_id, $mode, (int) $invoice->amount_cents
         ));
 
-        if ($existing && !empty($existing->order_id)) {
-            return [
-                'success'    => true,
-                'order_id'   => $existing->order_id,
-                'attempt_id' => (int) $existing->id,
-                'invoice_id' => $invoice_id,
-            ];
+        if ($existing) {
+            $order_res = LFA_PayPal_Client::get_order($existing->order_id, $mode);
+            $status    = $order_res['order']['status'] ?? '';
+            $url       = '';
+            if (in_array($status, ['CREATED', 'PAYER_ACTION_REQUIRED'], true)) {
+                $url = self::find_approve_link($order_res['order']);
+            } elseif (in_array($status, ['APPROVED', 'COMPLETED'], true)) {
+                // Payer already approved (or it was captured) — send them to the return page to finalise.
+                $url = add_query_arg('token', rawurlencode($existing->order_id), $ctx['return_url']);
+            }
+            if ($url !== '') {
+                return [
+                    'success'      => true,
+                    'order_id'     => $existing->order_id,
+                    'checkout_url' => $url,
+                    'session_url'  => $url,
+                    'approve_url'  => $url,
+                    'attempt_id'   => (int) $existing->id,
+                    'invoice_id'   => $invoice_id,
+                    'gateway'      => 'paypal',
+                    'reused'       => true,
+                ];
+            }
+            // Order expired/voided/unknown — retire it and create a fresh one.
+            $wpdb->update($t_att, ['state' => 'expired', 'updated_at' => current_time('mysql', true)], ['id' => $existing->id]);
         }
 
-        // Insert new initialized attempt
+        $local_key = !empty($request_key) ? sanitize_text_field($request_key) : wp_generate_uuid4();
         $now = current_time('mysql', true);
         $wpdb->insert($t_att, [
             'invoice_id'        => $invoice_id,
@@ -552,7 +618,9 @@ final class LFA_Payment_Service {
             'user_id'           => $user_id,
             'provider'          => 'paypal',
             'mode'              => $mode,
-            'merchant_identity' => LFA_PayPal_Settings::get_merchant_id($mode),
+            'gateway_environment' => $mode,
+            'test_transaction'  => $mode === 'live' ? 0 : 1,
+            'merchant_identity' => LFA_PayPal_Settings::get_merchant_id($mode) ?: null,
             'local_request_key' => $local_key,
             'order_id'          => null,
             'amount_cents'      => (int) $invoice->amount_cents,
@@ -561,46 +629,30 @@ final class LFA_Payment_Service {
             'created_at'        => $now,
             'updated_at'        => $now,
         ]);
-        $attempt_id = $wpdb->insert_id;
+        $attempt_id = (int) $wpdb->insert_id;
 
-        // Custom ID and description
-        if ($payable_type === 'donation') {
-            $custom_id = "lfa_don_{$invoice->id}_u_{$user_id}";
-            $desc = "Love Family Alumni Giving — Ref {$invoice->donation_ref} ({$invoice->purpose_snapshot})";
-        } elseif ($payable_type === 'conference') {
-            $reg = $check['registration'] ?? null;
-            $ticket_desc = $reg ? $reg->ticket_name_snapshot : 'Conference Pass';
-            $custom_id = "lfa_conf_inv_{$invoice->id}_u_{$user_id}";
-            $desc = "Love Family Alumni 2027 Conference Pass ({$ticket_desc}) — Invoice {$invoice->invoice_number}";
-        } else {
-            $custom_id = "lfa_inv_{$invoice->id}_u_{$user_id}";
-            $desc = "Love Family Alumni Annual Dues — Invoice {$invoice->invoice_number}";
-        }
-
-        // Call PayPal Orders v2 API
-        $paypal_res = LFA_PayPal_Client::create_order($invoice, $local_key, $mode, $custom_id, $desc);
+        $paypal_res = LFA_PayPal_Client::create_order($invoice, $local_key, $mode, $ctx['custom_id'], $ctx['desc'], $ctx['return_url'], $ctx['cancel_url']);
         if (!$paypal_res['success'] || empty($paypal_res['order_id'])) {
-            $wpdb->update($t_att, [
-                'state'      => 'failed',
-                'updated_at' => current_time('mysql', true),
-            ], ['id' => $attempt_id]);
-
-            self::log_audit($payable_type === 'conference' ? 'conference' : 'member', $user_id, 'order_create_failed', (string)$invoice_id, [
+            $wpdb->update($t_att, ['state' => 'failed', 'updated_at' => current_time('mysql', true)], ['id' => $attempt_id]);
+            self::log_audit($payable_type === 'conference' ? 'conference' : 'member', $user_id, 'order_create_failed', (string) $invoice_id, [
                 'error'        => $paypal_res['error'] ?? 'Unknown error',
+                'issue'        => $paypal_res['issue'] ?? '',
                 'payable_type' => $payable_type,
+                'mode'         => $mode,
             ]);
-
             return ['success' => false, 'error' => $paypal_res['error'] ?? 'PayPal order creation failed.'];
         }
 
-        $order_id = $paypal_res['order_id'];
+        $order_id     = $paypal_res['order_id'];
+        $checkout_url = $paypal_res['checkout_url'] ?? ($paypal_res['approve_url'] ?? '');
+
         $wpdb->update($t_att, [
             'order_id'   => $order_id,
             'state'      => 'order_created',
             'updated_at' => current_time('mysql', true),
         ], ['id' => $attempt_id]);
 
-        self::log_audit($payable_type === 'conference' ? 'conference' : 'member', $user_id, 'order_created', (string)$invoice_id, [
+        self::log_audit($payable_type === 'conference' ? 'conference' : 'member', $user_id, 'order_created', (string) $invoice_id, [
             'order_id'     => $order_id,
             'attempt_id'   => $attempt_id,
             'mode'         => $mode,
@@ -608,10 +660,14 @@ final class LFA_Payment_Service {
         ]);
 
         return [
-            'success'    => true,
-            'order_id'   => $order_id,
-            'attempt_id' => $attempt_id,
-            'invoice_id' => $invoice_id,
+            'success'      => true,
+            'order_id'     => $order_id,
+            'checkout_url' => $checkout_url,
+            'session_url'  => $checkout_url,
+            'approve_url'  => $checkout_url,
+            'attempt_id'   => $attempt_id,
+            'invoice_id'   => $invoice_id,
+            'gateway'      => 'paypal',
         ];
     }
 
@@ -623,245 +679,380 @@ final class LFA_Payment_Service {
     }
 
     /**
+     * Load a payable row and whether it is already paid.
+     *
+     * @return array{row:?object,paid:bool,ref:string}
+     */
+    private static function load_payable(string $p_type, int $id): array {
+        global $wpdb;
+        if ($p_type === 'donation') {
+            $row = class_exists('LFA_Donation') ? LFA_Donation::get_donation_by_id($id) : null;
+            return ['row' => $row, 'paid' => $row && $row->status === LFA_Donation::STATUS_PAID, 'ref' => $row ? (string) $row->donation_ref : ''];
+        }
+        if ($p_type === 'conference') {
+            $row = $wpdb->get_row($wpdb->prepare('SELECT * FROM ' . LFA_Conference::table_invoices() . ' WHERE id = %d', $id));
+            return ['row' => $row, 'paid' => $row && $row->status === LFA_Conference::INVOICE_STATUS_PAID, 'ref' => $row ? (string) $row->invoice_number : ''];
+        }
+        $row = $wpdb->get_row($wpdb->prepare('SELECT * FROM ' . LFA_Membership::table_invoices() . ' WHERE id = %d', $id));
+        return ['row' => $row, 'paid' => $row && $row->status === LFA_Membership::INVOICE_STATUS_PAID, 'ref' => $row ? (string) $row->invoice_number : ''];
+    }
+
+    private static function settled_response(string $p_type, object $row, string $ref, string $capture_id, bool $already): array {
+        $labels = [
+            'donation'   => 'Donation payment verified and settled successfully.',
+            'conference' => 'Conference registration confirmed and payment settled.',
+        ];
+        $res = [
+            'success'         => true,
+            'reconciled'      => true,
+            'already_settled' => $already,
+            'payable_type'    => $p_type,
+            'invoice_number'  => $ref,
+            'capture_id'      => $capture_id,
+            'amount_dollars'  => number_format(((int) $row->amount_cents) / 100, 2),
+            'status'          => 'COMPLETED',
+            'message'         => $already ? 'Payment was already settled.' : ($labels[$p_type] ?? 'Payment captured and membership standing updated to Current.'),
+        ];
+        if ($p_type === 'donation') {
+            $res['donation_ref']   = $ref;
+            $res['receipt_number'] = $ref;
+        }
+        return $res;
+    }
+
+    /**
      * Authoritative Server-Side Order Capture and Invoice Settlement
+     *
+     * Safe to call repeatedly (return page reload, JS + server double call, webhook race):
+     *  - ownership enforced, attempt is atomically claimed, PayPal capture is idempotent (PayPal-Request-Id),
+     *  - un-approved (cancelled) orders are detected BEFORE capture,
+     *  - already-captured orders are recovered via GET order instead of failing.
      */
     public static function capture_and_settle(string $order_id, int $user_id, string $request_key = '', string $payable_type = ''): array {
         global $wpdb;
         $t_att = self::table_attempts();
-        $t_cap = self::table_captures();
-        $mode = LFA_PayPal_Settings::get_mode();
+        $order_id = sanitize_text_field($order_id);
 
         // 1. Locate attempt and verify ownership
-        $attempt = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$t_att} WHERE order_id = %s", $order_id));
+        $attempt = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$t_att} WHERE order_id = %s AND provider = 'paypal'", $order_id));
         if (!$attempt) {
             return ['success' => false, 'error' => 'Invalid or unknown PayPal order ID.'];
         }
-
-        if ((int)$attempt->user_id !== $user_id) {
+        if ((int) $attempt->user_id !== 0 && (int) $attempt->user_id !== $user_id) {
             return ['success' => false, 'error' => 'Unauthorized: Member does not own this order attempt.'];
         }
 
-        $p_type = !empty($attempt->payable_type) ? $attempt->payable_type : (!empty($payable_type) ? $payable_type : 'membership_due');
-        $invoice_id = !empty($attempt->payable_id) ? (int)$attempt->payable_id : (int)$attempt->invoice_id;
+        $p_type     = !empty($attempt->payable_type) ? $attempt->payable_type : ($payable_type ?: 'membership_due');
+        $invoice_id = !empty($attempt->payable_id) ? (int) $attempt->payable_id : (int) $attempt->invoice_id;
+        $mode       = in_array($attempt->mode, ['sandbox', 'live'], true) ? $attempt->mode : LFA_PayPal_Settings::get_mode();
 
-        if ($p_type === 'conference') {
-            $t_inv = LFA_Conference::table_invoices();
-            $invoice = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$t_inv} WHERE id = %d", $invoice_id));
-            if (!$invoice) {
-                return ['success' => false, 'error' => 'Associated conference invoice not found.'];
-            }
-
-            // Concurrency / Idempotency Check
-            $existing_capture = $wpdb->get_row($wpdb->prepare(
-                "SELECT * FROM {$t_cap} WHERE (attempt_id = %d OR (payable_type = 'conference' AND payable_id = %d))",
-                (int)$attempt->id,
-                $invoice->id
-            ));
-            if ($existing_capture || $invoice->status === LFA_Conference::INVOICE_STATUS_PAID) {
-                return [
-                    'success'        => true,
-                    'already_settled'=> true,
-                    'invoice_number' => $invoice->invoice_number,
-                    'capture_id'     => $existing_capture ? $existing_capture->paypal_capture_id : '',
-                    'amount_dollars' => number_format($invoice->amount_cents / 100, 2),
-                    'status'         => 'COMPLETED',
-                    'message'        => 'Conference registration was already successfully settled.',
-                ];
-            }
-        } else {
-            $t_inv = LFA_Membership::table_invoices();
-            $invoice = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$t_inv} WHERE id = %d", $invoice_id));
-            if (!$invoice) {
-                return ['success' => false, 'error' => 'Associated invoice not found.'];
-            }
-
-            // Concurrency / Idempotency Check
-            $existing_capture = $wpdb->get_row($wpdb->prepare(
-                "SELECT * FROM {$t_cap} WHERE (attempt_id = %d OR (payable_type = 'membership_due' AND payable_id = %d))",
-                (int)$attempt->id,
-                $invoice->id
-            ));
-            if ($existing_capture || $invoice->status === LFA_Membership::INVOICE_STATUS_PAID) {
-                return [
-                    'success'        => true,
-                    'already_settled'=> true,
-                    'invoice_number' => $invoice->invoice_number,
-                    'capture_id'     => $existing_capture ? $existing_capture->paypal_capture_id : '',
-                    'amount_dollars' => number_format($invoice->amount_cents / 100, 2),
-                    'status'         => 'COMPLETED',
-                    'message'        => 'Invoice was already successfully settled.',
-                ];
-            }
+        $payable = self::load_payable($p_type, $invoice_id);
+        if (!$payable['row']) {
+            return ['success' => false, 'error' => 'Associated payable record not found.'];
         }
 
-        // 3. Mark attempt state as capture_processing
-        $now = current_time('mysql', true);
-        $wpdb->update($t_att, ['state' => 'capture_processing', 'updated_at' => $now], ['id' => $attempt->id]);
+        // 2. Already settled?
+        $t_cap = self::table_captures();
+        $existing_capture = $wpdb->get_row($wpdb->prepare(
+            "SELECT * FROM {$t_cap} WHERE attempt_id = %d OR (payable_type = %s AND payable_id = %d AND refund_state = 'none') ORDER BY id DESC LIMIT 1",
+            (int) $attempt->id, $p_type, $invoice_id
+        ));
+        if ($payable['paid'] || ($existing_capture && !empty($existing_capture->settled_at))) {
+            return self::settled_response($p_type, $payable['row'], $payable['ref'], $existing_capture ? (string) $existing_capture->paypal_capture_id : '', true);
+        }
 
-        // 4. Call PayPal Orders v2 Capture API
-        $capture_req_key = !empty($request_key) ? sanitize_text_field($request_key) : ("cap_" . md5($order_id . '_' . $attempt->id));
-        $cap_res = LFA_PayPal_Client::capture_order($order_id, $capture_req_key, $mode);
+        // 3. Atomically claim the attempt (prevents concurrent double capture/settle)
+        $claimed = $wpdb->query($wpdb->prepare(
+            "UPDATE {$t_att} SET state = 'capture_processing', updated_at = %s
+             WHERE id = %d AND (state IN ('initialized','order_created','failed','pending_verification')
+                    OR (state = 'capture_processing' AND updated_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL 2 MINUTE)))",
+            current_time('mysql', true), (int) $attempt->id
+        ));
+        if (!$claimed) {
+            $fresh = $wpdb->get_row($wpdb->prepare("SELECT state FROM {$t_att} WHERE id = %d", (int) $attempt->id));
+            if ($fresh && $fresh->state === 'captured') {
+                $payable = self::load_payable($p_type, $invoice_id);
+                return self::settled_response($p_type, $payable['row'], $payable['ref'], '', true);
+            }
+            return ['success' => false, 'pending' => true, 'error' => 'This payment is already being processed. Please wait a moment and refresh.'];
+        }
+        $set_state = static function (string $state) use ($wpdb, $t_att, $attempt): void {
+            $wpdb->update($t_att, ['state' => $state, 'updated_at' => current_time('mysql', true)], ['id' => (int) $attempt->id]);
+        };
+
+        // 4. Inspect order first: never try to capture an order the payer did not approve (e.g. cancelled).
+        $cap_res   = null;
+        $order_res = LFA_PayPal_Client::get_order($order_id, $mode);
+        $status    = $order_res['order']['status'] ?? '';
+
+        if (in_array($status, ['CREATED', 'PAYER_ACTION_REQUIRED', 'SAVED'], true)) {
+            $set_state('order_created');
+            return ['success' => false, 'not_approved' => true, 'error' => 'Payment was not approved in PayPal (cancelled or not completed). Your invoice remains unpaid — you can try again.'];
+        }
+        if ($status === 'VOIDED') {
+            $set_state('voided');
+            return ['success' => false, 'error' => 'This PayPal order was voided. Please start a new payment.'];
+        }
+        if ($status === 'COMPLETED') {
+            $cap_res = LFA_PayPal_Client::extract_capture_from_order($order_res['order'], $order_id);
+        }
+
+        // 5. Capture (idempotent per attempt via PayPal-Request-Id)
+        if (!$cap_res) {
+            $capture_req_key = !empty($request_key) ? sanitize_text_field($request_key) : ('cap_' . md5($order_id . '_' . $attempt->id));
+            $cap_res = LFA_PayPal_Client::capture_order($order_id, $capture_req_key, $mode);
+
+            if (!$cap_res['success'] && ($cap_res['issue'] ?? '') === 'ORDER_ALREADY_CAPTURED') {
+                $again = LFA_PayPal_Client::get_order($order_id, $mode);
+                if (!empty($again['success'])) {
+                    $cap_res = LFA_PayPal_Client::extract_capture_from_order($again['order'], $order_id);
+                }
+            }
+        }
 
         if (!$cap_res['success']) {
-            $wpdb->update($t_att, ['state' => 'failed', 'updated_at' => current_time('mysql', true)], ['id' => $attempt->id]);
+            $issue = $cap_res['issue'] ?? '';
+            $set_state($issue === 'ORDER_NOT_APPROVED' ? 'order_created' : 'failed');
             self::log_audit('member', $user_id, 'capture_api_failed', $order_id, [
                 'error'        => $cap_res['error'] ?? 'Capture API failure',
+                'issue'        => $issue,
                 'payable_type' => $p_type,
+                'mode'         => $mode,
             ]);
-            return ['success' => false, 'error' => $cap_res['error'] ?? 'PayPal capture failed.'];
+            $friendly = [
+                'INSTRUMENT_DECLINED' => 'Your PayPal funding source was declined. Please try again with a different card or funding source.',
+                'ORDER_NOT_APPROVED'  => 'Payment was not approved in PayPal. Your invoice remains unpaid.',
+                'PAYER_ACTION_REQUIRED' => 'PayPal requires additional action from the payer. Please restart the payment.',
+            ];
+            return ['success' => false, 'error' => $friendly[$issue] ?? ($cap_res['error'] ?? 'PayPal capture failed.')];
         }
 
-        // 5. Authoritative Verification Checks (Amount, Currency, Status, Merchant)
+        // 6. Verification checks
         if ($cap_res['capture_status'] !== 'COMPLETED') {
-            $wpdb->update($t_att, ['state' => 'pending_verification', 'updated_at' => current_time('mysql', true)], ['id' => $attempt->id]);
+            $set_state('pending_verification');
+            self::log_audit('system', $user_id, 'capture_pending', $order_id, [
+                'capture_id' => $cap_res['capture_id'], 'status' => $cap_res['capture_status'], 'payable_type' => $p_type,
+            ]);
             return [
                 'success' => false,
-                'error'   => 'Capture status is ' . sanitize_text_field($cap_res['capture_status']) . '. Payment verification is pending.',
                 'pending' => true,
+                'error'   => 'PayPal reports the payment as ' . sanitize_text_field($cap_res['capture_status']) . '. It will be confirmed automatically once PayPal completes it.',
             ];
         }
 
-        // Amount integrity check
-        if ((int)$cap_res['amount_cents'] !== (int)$invoice->amount_cents) {
-            $wpdb->update($t_att, ['state' => 'amount_mismatch', 'updated_at' => current_time('mysql', true)], ['id' => $attempt->id]);
-            self::log_audit('system', $user_id, 'capture_amount_mismatch', $order_id, [
-                'expected'     => $invoice->amount_cents,
-                'received'     => $cap_res['amount_cents'],
+        $res = self::settle_verified_capture($p_type, $invoice_id, $cap_res, $order_id, $mode, (int) $attempt->id, $user_id);
+        if (!$res['success']) {
+            $set_state($res['state'] ?? 'failed');
+        }
+        return $res;
+    }
+
+    /**
+     * Verify and settle a COMPLETED PayPal capture against a local payable.
+     * Shared by the return-page flow and the webhook. Idempotent.
+     */
+    private static function settle_verified_capture(string $p_type, int $invoice_id, array $cap, string $order_id, string $mode, int $attempt_id, int $actor_id): array {
+        global $wpdb;
+        $t_cap = self::table_captures();
+        $t_att = self::table_attempts();
+        $now   = current_time('mysql', true);
+
+        $payable = self::load_payable($p_type, $invoice_id);
+        $row     = $payable['row'];
+        if (!$row) {
+            return ['success' => false, 'error' => 'Associated payable record not found.'];
+        }
+
+        // Amount / currency integrity (money may already be captured → flag for review, never settle)
+        if ((int) $cap['amount_cents'] !== (int) $row->amount_cents || strtoupper((string) $cap['currency']) !== 'USD') {
+            self::log_audit('system', $actor_id, 'capture_amount_mismatch', $order_id, [
+                'expected'     => (int) $row->amount_cents,
+                'received'     => (int) $cap['amount_cents'],
+                'currency'     => $cap['currency'],
+                'capture_id'   => $cap['capture_id'],
                 'payable_type' => $p_type,
+                'action'       => 'REVIEW_AND_REFUND_REQUIRED',
             ]);
-            return ['success' => false, 'error' => 'Captured amount does not match authoritative invoice amount. Settle blocked.'];
+            return ['success' => false, 'state' => 'amount_mismatch', 'error' => 'Captured amount does not match the invoice. The payment has been flagged for administrator review.'];
         }
 
-        // Currency integrity check
-        if (strtoupper($cap_res['currency']) !== 'USD') {
-            $wpdb->update($t_att, ['state' => 'currency_mismatch', 'updated_at' => current_time('mysql', true)], ['id' => $attempt->id]);
-            return ['success' => false, 'error' => 'Captured currency is not USD. Settle blocked.'];
+        // Payee check (orders are created with our own credentials; mismatch indicates misconfiguration)
+        $expected_payee = LFA_PayPal_Settings::get_merchant_id($mode);
+        if ($expected_payee !== '' && !empty($cap['payee_merchant_id']) && $cap['payee_merchant_id'] !== $expected_payee) {
+            self::log_audit('system', $actor_id, 'capture_payee_mismatch', $order_id, [
+                'expected' => $expected_payee, 'received' => $cap['payee_merchant_id'], 'mode' => $mode,
+            ]);
         }
 
-        // 6. Atomic Database Settle Transaction
-        $capture_id = $cap_res['capture_id'];
-        $captured_at = $cap_res['captured_at'];
+        // A capture row may already exist: settled (→ done) or left half-finished by an earlier crash (→ finish it).
+        $prior = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$t_cap} WHERE paypal_capture_id = %s", $cap['capture_id']));
+        if ($prior && !empty($prior->settled_at) && $payable['paid']) {
+            if ($attempt_id) {
+                $wpdb->update($t_att, ['state' => 'captured', 'updated_at' => $now], ['id' => $attempt_id]);
+            }
+            return self::settled_response($p_type, $row, $payable['ref'], $cap['capture_id'], true);
+        }
 
-        // Insert capture record
-        $wpdb->insert($t_cap, [
-            'attempt_id'        => (int) $attempt->id,
-            'invoice_id'        => (int) $invoice->id,
-            'payable_type'      => $p_type,
-            'payable_id'        => (int) $invoice->id,
-            'paypal_capture_id' => $capture_id,
-            'paypal_order_id'   => $order_id,
-            'merchant_identity' => $cap_res['payee_merchant_id'] ?: null,
-            'mode'              => $mode,
-            'amount_cents'      => (int) $cap_res['amount_cents'],
-            'currency'          => 'USD',
-            'capture_status'    => 'COMPLETED',
-            'captured_at'       => $captured_at,
-            'reconciled_at'     => $now,
-            'refund_state'      => 'none',
-            'last_checked_at'   => $now,
+        // Record capture — UNIQUE(paypal_capture_id) makes this the idempotency gate.
+        $inserted = $prior ? false : $wpdb->insert($t_cap, [
+            'attempt_id'          => $attempt_id,
+            'invoice_id'          => $invoice_id,
+            'gateway_provider'    => 'paypal',
+            'payable_type'        => $p_type,
+            'payable_id'          => $invoice_id,
+            'paypal_capture_id'   => $cap['capture_id'],
+            'paypal_order_id'     => $order_id,
+            'provider_payment_id' => $order_id,
+            'merchant_identity'   => $cap['payee_merchant_id'] ?: null,
+            'mode'                => $mode,
+            'gateway_environment' => $mode,
+            'amount_cents'        => (int) $cap['amount_cents'],
+            'currency'            => 'USD',
+            'capture_status'      => 'COMPLETED',
+            'payment_status'      => 'COMPLETED',
+            'captured_at'         => $cap['captured_at'],
+            'verified_at'         => $now,
+            'reconciled_at'       => $now,
+            'refund_state'        => 'none',
+            'last_checked_at'     => $now,
+            'test_transaction'    => $mode === 'live' ? 0 : 1,
         ]);
-        $capture_record_id = $wpdb->insert_id;
-
-        // Transition attempt state to captured
-        $wpdb->update($t_att, ['state' => 'captured', 'updated_at' => $now], ['id' => $attempt->id]);
+        if ($prior) {
+            $capture_record_id = (int) $prior->id; // recover an unfinished settlement
+        } elseif (!$inserted) {
+            // A concurrent request (e.g. webhook vs return page) recorded this capture first and is settling it.
+            if ($attempt_id) {
+                $wpdb->update($t_att, ['state' => 'captured', 'updated_at' => $now], ['id' => $attempt_id]);
+            }
+            $payable = self::load_payable($p_type, $invoice_id);
+            return self::settled_response($p_type, $payable['row'], $payable['ref'], $cap['capture_id'], true);
+        } else {
+            $capture_record_id = (int) $wpdb->insert_id;
+        }
+        $test_flag = $mode === 'live' ? 0 : 1;
 
         if ($p_type === 'donation') {
-            LFA_Donation::settle_donation((int)$invoice->id, $capture_id, $order_id, (int)$cap_res['amount_cents']);
-
-            return [
-                'success'        => true,
-                'invoice_number' => $invoice->donation_ref,
-                'donation_ref'   => $invoice->donation_ref,
-                'capture_id'     => $capture_id,
-                'amount_dollars' => number_format($invoice->amount_cents / 100, 2),
-                'status'         => 'COMPLETED',
-                'message'        => 'Donation payment verified and settled successfully.',
-            ];
+            LFA_Donation::settle_donation($invoice_id, $cap['capture_id'], $order_id, (int) $cap['amount_cents']);
+            $wpdb->query($wpdb->prepare(
+                'UPDATE ' . LFA_Donation::table_donations() . " SET gateway_provider = 'paypal', provider_payment_id = %s, test_transaction = %d WHERE id = %d",
+                $order_id, $test_flag, $invoice_id
+            ));
+        } elseif ($p_type === 'conference') {
+            LFA_Conference::settle_registration($invoice_id, $cap['capture_id'], (int) $cap['amount_cents']);
+            $wpdb->query($wpdb->prepare(
+                'UPDATE ' . LFA_Conference::table_invoices() . " SET gateway_provider = 'paypal', provider_payment_id = %s, test_paid = %d WHERE id = %d",
+                $order_id, $test_flag, $invoice_id
+            ));
+            $wpdb->query($wpdb->prepare(
+                'UPDATE ' . LFA_Conference::table_registrations() . " SET gateway_provider = 'paypal', provider_payment_id = %s, test_paid = %d WHERE id = %d",
+                $order_id, $test_flag, (int) $row->registration_id
+            ));
+        } else {
+            self::settle_membership_invoice($invoice_id, $order_id, $test_flag);
         }
 
-        if ($p_type === 'conference') {
-            // Settle conference registration and invoice
-            LFA_Conference::settle_registration((int)$invoice->id, $capture_id, (int)$cap_res['amount_cents']);
-
-            return [
-                'success'        => true,
-                'invoice_number' => $invoice->invoice_number,
-                'capture_id'     => $capture_id,
-                'amount_dollars' => number_format($invoice->amount_cents / 100, 2),
-                'status'         => 'COMPLETED',
-                'message'        => 'Conference registration confirmed and payment settled.',
-            ];
+        $wpdb->update($t_cap, ['settled_at' => $now, 'entitlement_effect' => 'granted'], ['id' => $capture_record_id]);
+        if ($attempt_id) {
+            $wpdb->update($t_att, ['state' => 'captured', 'provider_payment_id' => $cap['capture_id'], 'updated_at' => $now], ['id' => $attempt_id]);
         }
 
-        // Membership dues settlement
-        $wpdb->update($t_inv, [
-            'status'     => LFA_Membership::INVOICE_STATUS_PAID,
-            'paid_at'    => $now,
-            'updated_at' => $now,
-        ], ['id' => $invoice->id]);
+        self::log_audit('member', $actor_id ?: null, 'payment_settled_paypal', (string) $invoice_id, [
+            'payable_type' => $p_type,
+            'capture_id'   => $cap['capture_id'],
+            'order_id'     => $order_id,
+            'amount_cents' => (int) $cap['amount_cents'],
+            'mode'         => $mode,
+        ]);
 
+        if ($p_type === 'membership_due') {
+            self::send_receipt_email($invoice_id, $cap['capture_id']);
+        }
+        if (class_exists('LFA_Gateway_Settings')) {
+            LFA_Gateway_Settings::record_last_transaction('paypal', [
+                'payable_type' => $p_type, 'amount_cents' => (int) $cap['amount_cents'], 'at' => $now,
+            ], $mode);
+        }
+
+        $payable = self::load_payable($p_type, $invoice_id);
+        return self::settled_response($p_type, $payable['row'], $payable['ref'], $cap['capture_id'], false);
+    }
+
+    /**
+     * Mark a membership dues invoice paid and advance the member's standing (same rules as Stripe).
+     */
+    public static function settle_membership_invoice(int $invoice_id, string $provider_payment_id, int $test_flag): void {
+        global $wpdb;
+        $t_inv = LFA_Membership::table_invoices();
         $t_mem = LFA_Membership::table_memberships();
-        $wpdb->update($t_mem, [
-            'status'     => LFA_Membership::STANDING_CURRENT,
-            'updated_at' => $now,
-        ], ['user_id' => $user_id]);
-
-        $one_year_later = LFA_Membership::calculate_calendar_year_expiry($now);
-        $period_id = (int)$invoice->period_id;
         $t_per = LFA_Membership::table_periods();
+        $now   = current_time('mysql', true);
+
+        $inv = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$t_inv} WHERE id = %d", $invoice_id));
+        if (!$inv) {
+            return;
+        }
+        $owner = (int) $inv->user_id;
+
+        $wpdb->update($t_inv, ['status' => LFA_Membership::INVOICE_STATUS_PAID, 'paid_at' => $now, 'updated_at' => $now], ['id' => $invoice_id]);
+        $wpdb->query($wpdb->prepare(
+            "UPDATE {$t_inv} SET gateway_provider = 'paypal', provider_payment_id = %s, test_paid = %d WHERE id = %d",
+            $provider_payment_id, $test_flag, $invoice_id
+        ));
+        $wpdb->update($t_mem, ['status' => LFA_Membership::STANDING_CURRENT, 'updated_at' => $now], ['user_id' => $owner]);
+
+        $expiry    = LFA_Membership::calculate_calendar_year_expiry($now);
+        $period_id = (int) $inv->period_id;
         if ($period_id <= 0) {
-            $mem_row = $wpdb->get_row($wpdb->prepare("SELECT id FROM {$t_mem} WHERE user_id = %d", $user_id));
+            $mem_row = $wpdb->get_row($wpdb->prepare("SELECT id FROM {$t_mem} WHERE user_id = %d", $owner));
             if ($mem_row) {
                 $existing_per = $wpdb->get_row($wpdb->prepare("SELECT id FROM {$t_per} WHERE membership_id = %d ORDER BY id DESC LIMIT 1", $mem_row->id));
                 if ($existing_per) {
-                    $period_id = (int)$existing_per->id;
+                    $period_id = (int) $existing_per->id;
                 } else {
-                    $current_year = (int) gmdate('Y', strtotime($now));
-                    $period_key = $current_year . '/' . ($current_year + 1);
+                    $y = (int) gmdate('Y', strtotime($now));
                     $wpdb->insert($t_per, [
                         'membership_id' => $mem_row->id,
-                        'period_key'    => $period_key,
+                        'period_key'    => $y . '/' . ($y + 1),
                         'standing'      => LFA_Membership::STANDING_CURRENT,
                         'starts_at'     => $now,
-                        'ends_at'       => $one_year_later,
+                        'ends_at'       => $expiry,
                         'created_at'    => $now,
                         'updated_at'    => $now,
                     ]);
                     $period_id = (int) $wpdb->insert_id;
                 }
-                $wpdb->update($t_inv, ['period_id' => $period_id], ['id' => $invoice->id]);
+                $wpdb->update($t_inv, ['period_id' => $period_id], ['id' => $invoice_id]);
             }
         }
-
         if ($period_id > 0) {
             $wpdb->update($t_per, [
                 'standing'   => LFA_Membership::STANDING_CURRENT,
                 'starts_at'  => $now,
-                'ends_at'    => $one_year_later,
+                'ends_at'    => $expiry,
                 'updated_at' => $now,
             ], ['id' => $period_id]);
         }
 
-        update_user_meta($user_id, 'lfa_dues_status', 'current');
+        update_user_meta($owner, 'lfa_dues_status', 'current');
+        if ($test_flag) {
+            update_user_meta($owner, 'lfa_test_paid', 1);
+        }
+    }
 
-        self::log_audit('member', $user_id, 'payment_settled', (string)$invoice->id, [
-            'invoice_number' => $invoice->invoice_number,
-            'capture_id'     => $capture_id,
-            'order_id'       => $order_id,
-            'amount_cents'   => $cap_res['amount_cents'],
-            'payable_type'   => 'membership_due',
-        ]);
-
-        self::send_receipt_email((int)$invoice->id, $capture_id);
-
-        return [
-            'success'        => true,
-            'invoice_number' => $invoice->invoice_number,
-            'capture_id'     => $capture_id,
-            'amount_dollars' => number_format($invoice->amount_cents / 100, 2),
-            'status'         => 'COMPLETED',
-            'message'        => 'Payment captured and membership standing updated to Current.',
-        ];
+    /**
+     * Parse our custom_id → [payable_type, payable_id, user_id]
+     */
+    private static function parse_custom_id(string $custom_id): ?array {
+        if (preg_match('/^lfa_conf_inv_(\d+)_u_(\d+)$/', $custom_id, $m)) {
+            return ['conference', (int) $m[1], (int) $m[2]];
+        }
+        if (preg_match('/^lfa_don_(\d+)_u_(\d+)$/', $custom_id, $m)) {
+            return ['donation', (int) $m[1], (int) $m[2]];
+        }
+        if (preg_match('/^lfa_inv_(\d+)_u_(\d+)$/', $custom_id, $m)) {
+            return ['membership_due', (int) $m[1], (int) $m[2]];
+        }
+        return null;
     }
 
     /**
@@ -870,28 +1061,42 @@ final class LFA_Payment_Service {
     public static function handle_webhook(array $headers, string $raw_body): array {
         global $wpdb;
         $t_events = self::table_webhook_events();
-        $mode = LFA_PayPal_Settings::get_mode();
+        $t_cap    = self::table_captures();
+        $t_att    = self::table_attempts();
 
         $event = json_decode($raw_body, true);
         if (!is_array($event) || empty($event['id']) || empty($event['event_type'])) {
             return ['status' => 400, 'error' => 'Malformed webhook payload.'];
         }
 
-        $event_id = sanitize_text_field($event['id']);
+        $event_id   = sanitize_text_field($event['id']);
         $event_type = sanitize_text_field($event['event_type']);
 
-        // Check deduplication (P4-035, P4-067)
         $existing = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$t_events} WHERE paypal_event_id = %s", $event_id));
         if ($existing && $existing->processing_state === 'processed') {
             return ['status' => 200, 'message' => 'Event already processed idempotently.'];
         }
 
-        // Verify Signature
-        $sig_res = LFA_PayPal_Client::verify_webhook_signature($headers, $raw_body, $mode);
-        if (!$sig_res['verified']) {
+        // Verify signature against the active environment first, then the other configured one
+        // (lets sandbox + live webhooks both point at this endpoint safely).
+        $active = LFA_PayPal_Settings::get_mode();
+        $mode   = null;
+        $sig_error = '';
+        foreach (array_unique([$active, $active === 'live' ? 'sandbox' : 'live']) as $candidate) {
+            if (LFA_PayPal_Settings::get_webhook_id($candidate) === '' || !LFA_PayPal_Settings::get_secret($candidate)) {
+                continue;
+            }
+            $sig = LFA_PayPal_Client::verify_webhook_signature($headers, $raw_body, $candidate);
+            if (!empty($sig['verified'])) {
+                $mode = $candidate;
+                break;
+            }
+            $sig_error = $sig['error'] ?? 'Invalid signature';
+        }
+        if (!$mode) {
             self::log_audit('system', null, 'webhook_signature_rejected', $event_id, [
                 'event_type' => $event_type,
-                'error'      => $sig_res['error'] ?? 'Invalid signature',
+                'error'      => $sig_error ?: 'No environment with webhook ID + credentials configured.',
             ]);
             return ['status' => 401, 'error' => 'Webhook signature verification failed.'];
         }
@@ -900,7 +1105,9 @@ final class LFA_Payment_Service {
         if (!$existing) {
             $wpdb->insert($t_events, [
                 'paypal_event_id'        => $event_id,
-                'paypal_transmission_id' => $headers['paypal-transmission-id'] ?? ($headers['PAYPAL-TRANSMISSION-ID'] ?? null),
+                'gateway_provider'       => 'paypal',
+                'provider_event_id'      => $event_id,
+                'paypal_transmission_id' => $headers['paypal_transmission_id'][0] ?? ($headers['paypal-transmission-id'] ?? null),
                 'event_type'             => $event_type,
                 'mode'                   => $mode,
                 'verified_at'            => $now,
@@ -909,111 +1116,131 @@ final class LFA_Payment_Service {
                 'failure_count'          => 0,
                 'created_at'             => $now,
             ]);
-            $event_row_id = $wpdb->insert_id;
+            $event_row_id = (int) $wpdb->insert_id;
         } else {
-            $event_row_id = $existing->id;
+            $event_row_id = (int) $existing->id;
         }
 
-        // Process Event Family
-        $settled = false;
-        if ($event_type === 'PAYMENT.CAPTURE.COMPLETED') {
-            $resource = $event['resource'] ?? [];
-            $capture_id = $resource['id'] ?? '';
-            $custom_id = $resource['custom_id'] ?? '';
+        $resource = is_array($event['resource'] ?? null) ? $event['resource'] : [];
+        $note     = 'ignored';
 
-            // Correlate with local invoice (Conference vs Dues)
-            if (preg_match('/lfa_conf_inv_(\d+)_u_(\d+)/', $custom_id, $matches)) {
-                $invoice_id = (int) $matches[1];
-                $user_id = (int) $matches[2];
-
-                $t_conf_inv = LFA_Conference::table_invoices();
-                $inv = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$t_conf_inv} WHERE id = %d", $invoice_id));
-                if ($inv && $inv->status !== LFA_Conference::INVOICE_STATUS_PAID) {
-                    $t_cap = self::table_captures();
-                    $cap_check = $wpdb->get_row($wpdb->prepare("SELECT id FROM {$t_cap} WHERE paypal_capture_id = %s", $capture_id));
-                    if (!$cap_check) {
-                        $captured_cents = isset($resource['amount']['value']) ? (int) round(((float)$resource['amount']['value']) * 100) : 0;
-                        if ($captured_cents === (int)$inv->amount_cents) {
-                            $wpdb->insert($t_cap, [
-                                'attempt_id'        => 0,
-                                'invoice_id'        => $invoice_id,
-                                'payable_type'      => 'conference',
-                                'payable_id'        => $invoice_id,
-                                'paypal_capture_id' => $capture_id,
-                                'paypal_order_id'   => $resource['supplementary_data']['related_ids']['order_id'] ?? 'webhook',
-                                'merchant_identity' => $resource['payee']['merchant_id'] ?? null,
-                                'mode'              => $mode,
-                                'amount_cents'      => $captured_cents,
-                                'currency'          => 'USD',
-                                'capture_status'    => 'COMPLETED',
-                                'captured_at'       => $now,
-                                'reconciled_at'     => $now,
-                                'refund_state'      => 'none',
-                                'last_checked_at'   => $now,
-                            ]);
-                            LFA_Conference::settle_registration($invoice_id, $capture_id, $captured_cents);
-                            $settled = true;
-                        }
+        try {
+            switch ($event_type) {
+                case 'PAYMENT.CAPTURE.COMPLETED':
+                    $parsed = self::parse_custom_id((string) ($resource['custom_id'] ?? ''));
+                    if (!$parsed) {
+                        $note = 'unrecognised custom_id';
+                        break;
                     }
-                }
-            } elseif (preg_match('/lfa_inv_(\d+)_u_(\d+)/', $custom_id, $matches)) {
-                $invoice_id = (int) $matches[1];
-                $user_id = (int) $matches[2];
+                    [$p_type, $pid, $uid] = $parsed;
+                    $order_id = (string) ($resource['supplementary_data']['related_ids']['order_id'] ?? '');
+                    $attempt  = $order_id !== '' ? $wpdb->get_row($wpdb->prepare("SELECT * FROM {$t_att} WHERE order_id = %s", $order_id)) : null;
 
-                if ($invoice_id > 0) {
-                    $t_inv = LFA_Membership::table_invoices();
-                    $inv = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$t_inv} WHERE id = %d", $invoice_id));
-                    if ($inv && $inv->status !== LFA_Membership::INVOICE_STATUS_PAID) {
-                        $t_cap = self::table_captures();
-                        $cap_check = $wpdb->get_row($wpdb->prepare("SELECT id FROM {$t_cap} WHERE paypal_capture_id = %s", $capture_id));
-                        if (!$cap_check) {
-                            $captured_cents = isset($resource['amount']['value']) ? (int) round(((float)$resource['amount']['value']) * 100) : 0;
-                            if ($captured_cents === (int)$inv->amount_cents) {
-                                $wpdb->insert($t_cap, [
-                                    'attempt_id'        => 0,
-                                    'invoice_id'        => $invoice_id,
-                                    'payable_type'      => 'membership_due',
-                                    'payable_id'        => $invoice_id,
-                                    'paypal_capture_id' => $capture_id,
-                                    'paypal_order_id'   => $resource['supplementary_data']['related_ids']['order_id'] ?? 'webhook',
-                                    'merchant_identity' => $resource['payee']['merchant_id'] ?? null,
-                                    'mode'              => $mode,
-                                    'amount_cents'      => $captured_cents,
-                                    'currency'          => 'USD',
-                                    'capture_status'    => 'COMPLETED',
-                                    'captured_at'       => $now,
-                                    'reconciled_at'     => $now,
-                                    'refund_state'      => 'none',
-                                    'last_checked_at'   => $now,
-                                ]);
-                                $wpdb->update($t_inv, ['status' => LFA_Membership::INVOICE_STATUS_PAID], ['id' => $invoice_id]);
-                                $t_mem = LFA_Membership::table_memberships();
-                                $wpdb->update($t_mem, ['status' => LFA_Membership::STANDING_CURRENT, 'updated_at' => $now], ['user_id' => $inv->user_id]);
-                                self::send_receipt_email($invoice_id, $capture_id);
-                                $settled = true;
+                    $payable = self::load_payable($p_type, $pid);
+                    if (!$payable['row'] || $payable['paid']) {
+                        $note = $payable['row'] ? 'already settled' : 'payable not found';
+                        if ($attempt && $payable['paid']) {
+                            $wpdb->update($t_att, ['state' => 'captured', 'updated_at' => $now], ['id' => $attempt->id]);
+                        }
+                        break;
+                    }
+
+                    $cap = [
+                        'capture_id'        => (string) ($resource['id'] ?? ''),
+                        'capture_status'    => (string) ($resource['status'] ?? 'COMPLETED'),
+                        'amount_cents'      => isset($resource['amount']['value']) ? (int) round(((float) $resource['amount']['value']) * 100) : 0,
+                        'currency'          => (string) ($resource['amount']['currency_code'] ?? ''),
+                        'payee_merchant_id' => (string) ($resource['payee']['merchant_id'] ?? ''),
+                        'captured_at'       => !empty($resource['create_time']) ? gmdate('Y-m-d H:i:s', strtotime($resource['create_time'])) : $now,
+                    ];
+                    $res = self::settle_verified_capture($p_type, $pid, $cap, $order_id ?: 'webhook', $mode, $attempt ? (int) $attempt->id : 0, $uid);
+                    if (!$res['success'] && $attempt) {
+                        $wpdb->update($t_att, ['state' => $res['state'] ?? 'failed', 'updated_at' => $now], ['id' => $attempt->id]);
+                    }
+                    $note = $res['success'] ? 'settled' : ($res['error'] ?? 'settle failed');
+                    break;
+
+                case 'PAYMENT.CAPTURE.DENIED':
+                case 'PAYMENT.CAPTURE.DECLINED':
+                    $order_id = (string) ($resource['supplementary_data']['related_ids']['order_id'] ?? '');
+                    if ($order_id !== '') {
+                        $wpdb->update($t_att, ['state' => 'denied', 'updated_at' => $now], ['order_id' => $order_id]);
+                    }
+                    self::log_audit('system', null, 'payment_capture_denied', $event_id, ['order_id' => $order_id, 'capture_id' => $resource['id'] ?? '']);
+                    $note = 'attempt marked denied';
+                    break;
+
+                case 'PAYMENT.CAPTURE.REFUNDED':
+                case 'PAYMENT.CAPTURE.REVERSED':
+                    // REFUNDED: resource = refund (capture via links rel=up). REVERSED: resource = the capture itself.
+                    $capture_id = '';
+                    if ($event_type === 'PAYMENT.CAPTURE.REVERSED') {
+                        $capture_id = (string) ($resource['id'] ?? '');
+                    } else {
+                        foreach (($resource['links'] ?? []) as $link) {
+                            if (($link['rel'] ?? '') === 'up' && preg_match('#/captures/([^/?\#]+)#', (string) ($link['href'] ?? ''), $mm)) {
+                                $capture_id = $mm[1];
+                                break;
                             }
                         }
                     }
-                }
+                    $capture = $capture_id !== '' ? $wpdb->get_row($wpdb->prepare("SELECT * FROM {$t_cap} WHERE paypal_capture_id = %s", $capture_id)) : null;
+                    if (!$capture) {
+                        $note = 'capture not found locally';
+                        break;
+                    }
+
+                    $refund_cents = isset($resource['amount']['value']) ? (int) round(((float) $resource['amount']['value']) * 100) : (int) $capture->amount_cents;
+                    $total_refunded = isset($resource['seller_payable_breakdown']['total_refunded_amount']['value'])
+                        ? (int) round(((float) $resource['seller_payable_breakdown']['total_refunded_amount']['value']) * 100)
+                        : $refund_cents;
+                    $is_full = $event_type === 'PAYMENT.CAPTURE.REVERSED' || $total_refunded >= (int) $capture->amount_cents;
+
+                    if ($is_full) {
+                        LFA_Payment_Entitlements::handle_refund((int) $capture->payable_id, (string) $capture->payable_type, strtolower($event_type));
+                        $wpdb->update($t_cap, [
+                            'refund_state'       => $event_type === 'PAYMENT.CAPTURE.REVERSED' ? 'reversed' : 'refunded',
+                            'entitlement_effect' => 'revoked',
+                            'refunded_at'        => $now,
+                            'last_checked_at'    => $now,
+                        ], ['id' => $capture->id]);
+                        $note = 'full refund applied, entitlement revoked';
+                    } else {
+                        $wpdb->update($t_cap, ['refund_state' => 'partial_review_required', 'last_checked_at' => $now], ['id' => $capture->id]);
+                        $note = 'partial refund flagged for review';
+                    }
+                    self::log_audit('system', null, 'payment_refund_detected', $event_id, [
+                        'event_type'   => $event_type,
+                        'capture_id'   => $capture_id,
+                        'refund_cents' => $refund_cents,
+                        'full'         => $is_full,
+                    ]);
+                    break;
+
+                default:
+                    $note = 'event type not handled';
             }
-        } elseif ($event_type === 'PAYMENT.CAPTURE.REFUNDED' || $event_type === 'PAYMENT.CAPTURE.REVERSED') {
-            $resource = $event['resource'] ?? [];
-            $capture_id = $resource['links'][0]['href'] ?? ''; // or parse related capture ID
-            $t_cap = self::table_captures();
-            $wpdb->query($wpdb->prepare("UPDATE {$t_cap} SET refund_state = 'review_required', last_checked_at = %s WHERE paypal_capture_id LIKE %s", $now, '%' . $event['id'] . '%'));
-            self::log_audit('system', null, 'payment_refund_detected', $event_id, [
-                'event_type' => $event_type,
-                'status'     => 'review_required',
-            ]);
+        } catch (Throwable $e) {
+            $wpdb->query($wpdb->prepare(
+                "UPDATE {$t_events} SET processing_state = 'failed', failure_count = failure_count + 1, last_error_code = %s WHERE id = %d",
+                substr(sanitize_text_field($e->getMessage()), 0, 100), $event_row_id
+            ));
+            self::log_audit('system', null, 'webhook_processing_failed', $event_id, ['event_type' => $event_type, 'error' => $e->getMessage()]);
+            // Non-2xx → PayPal retries delivery later.
+            return ['status' => 500, 'error' => 'Webhook processing failed; will retry.'];
         }
 
-        // Mark event processed
         $wpdb->update($t_events, [
             'processing_state' => 'processed',
             'processed_at'     => $now,
+            'last_error_code'  => substr($note, 0, 100),
         ], ['id' => $event_row_id]);
 
-        return ['status' => 200, 'message' => 'Webhook received and processed.'];
+        if (class_exists('LFA_Gateway_Settings')) {
+            LFA_Gateway_Settings::record_webhook_event('paypal', ['event_type' => $event_type, 'at' => $now, 'result' => $note], $mode);
+        }
+
+        return ['status' => 200, 'message' => 'Webhook processed: ' . $note];
     }
 
     /**
@@ -1057,11 +1284,11 @@ final class LFA_Payment_Service {
         // Metadata-only email logging
         $domain = substr(strrchr($user->user_email, '@') ?: '@unknown', 1);
         $wpdb->insert($wpdb->prefix . 'lfa_membership_audit', [
-            'actor_user_id' => 0,
-            'target_user_id'=> $inv->user_id,
-            'action'        => 'receipt_email_sent',
-            'entity_type'   => 'invoice',
-            'entity_id'     => $inv->id,
+            'actor_user_id'   => 0,
+            'subject_user_id' => (int) $inv->user_id,
+            'action'          => 'receipt_email_sent',
+            'object_type'     => 'invoice',
+            'object_id'       => (int) $inv->id,
             'metadata_json' => wp_json_encode([
                 'recipient_domain' => $domain,
                 'invoice_number'   => $inv->invoice_number,

@@ -140,6 +140,7 @@ final class LFA_Conference_REST {
             return new WP_REST_Response(['error' => 'Conference record not found.'], 404);
         }
 
+        $reg_state = LFA_Conference::get_registration_state($conf);
         $tickets = LFA_Conference::get_ticket_types((int)$conf->id, true);
         $ticket_data = [];
         foreach ($tickets as $t) {
@@ -166,6 +167,9 @@ final class LFA_Conference_REST {
             'timezone'                   => $conf->timezone,
             'location_summary'           => $conf->location_summary,
             'registration_status'        => $conf->registration_status,
+            'registration_open'          => $reg_state['is_open'],
+            'registration_state'         => $reg_state['code'],
+            'registration_message'       => $reg_state['message'],
             'guest_registration_enabled' => (bool)$conf->guest_registration_enabled,
             'tickets'                    => $ticket_data,
         ], 200);
@@ -186,11 +190,20 @@ final class LFA_Conference_REST {
             $code = $res['code'] ?? 'REGISTRATION_FAILED';
             $forbidden_codes = ['ACCOUNT_NOT_APPROVED', 'GUEST_REGISTRATION_DISABLED', 'MEMBERSHIP_REQUIRED', 'MEMBERSHIP_UNPAID', 'MEMBERSHIP_EXPIRED', 'MEMBERSHIP_DUES_REQUIRED'];
             $status = in_array($code, $forbidden_codes, true) ? 403 : 400;
-            return new WP_REST_Response([
+            $res_data = [
                 'success' => false,
                 'code'    => $code,
                 'message' => $res['error'],
-            ], $status);
+            ];
+            if (!empty($res['existing_registration_id'])) {
+                $res_data['existing_registration_id'] = $res['existing_registration_id'];
+                $res_data['registration_number']      = $res['registration_number'] ?? '';
+                $res_data['status']                   = $res['status'] ?? '';
+                $res_data['ticket_name']              = $res['ticket_name'] ?? '';
+                $res_data['invoice_id']               = $res['invoice_id'] ?? null;
+                $res_data['amount_dollars']           = $res['amount_dollars'] ?? '150.00';
+            }
+            return new WP_REST_Response($res_data, $status);
         }
 
         return new WP_REST_Response($res, 201);
@@ -223,8 +236,12 @@ final class LFA_Conference_REST {
                 $r->id
             ));
 
+            $r_conf = LFA_Conference::get_conference_by_id((int)$r->conference_id);
             $output[] = [
                 'id'                   => (int)$r->id,
+                'conference_id'        => (int)$r->conference_id,
+                'conference_title'     => $r_conf ? $r_conf->title : '',
+                'conference_dates'     => LFA_Conference::format_date_range($r_conf),
                 'registration_number'  => $r->registration_number,
                 'ticket_name'          => $r->ticket_name_snapshot,
                 'amount_cents'         => (int)$r->amount_cents_snapshot,

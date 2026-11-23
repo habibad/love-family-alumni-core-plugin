@@ -100,7 +100,6 @@ final class LFA_Scholarship_Admin {
         $end = !empty($_POST['application_window_end']) ? sanitize_text_field($_POST['application_window_end']) : null;
         $tz = sanitize_text_field($_POST['timezone'] ?? 'America/New_York');
         $status = sanitize_key($_POST['status'] ?? LFA_Scholarship::PROGRAM_DRAFT);
-        $guest_allowed = !empty($_POST['guest_application_enabled']) ? 1 : 0;
 
         if (empty($title) || empty($slug)) {
             wp_die('Program title and slug are required.');
@@ -118,7 +117,6 @@ final class LFA_Scholarship_Admin {
                 'application_window_end'   => $end,
                 'timezone'                 => $tz,
                 'status'                   => $status,
-                'guest_application_enabled'=> $guest_allowed,
                 'updated_at'               => $now,
             ], ['id' => $prog_id]);
 
@@ -134,7 +132,6 @@ final class LFA_Scholarship_Admin {
                 'application_window_end'   => $end,
                 'timezone'                 => $tz,
                 'status'                   => $status,
-                'guest_application_enabled'=> $guest_allowed,
                 'created_by'               => get_current_user_id(),
                 'created_at'               => $now,
                 'updated_at'               => $now,
@@ -356,13 +353,12 @@ final class LFA_Scholarship_Admin {
                                     <th>Slug</th>
                                     <th>Status</th>
                                     <th>Window (Start &ndash; End)</th>
-                                    <th>Guest Apply</th>
                                     <th>Actions</th>
                                 </tr>
                             </thead>
                             <tbody>
                                 <?php if (empty($programs)): ?>
-                                    <tr><td colspan="7">No programs found.</td></tr>
+                                    <tr><td colspan="6">No programs found.</td></tr>
                                 <?php else: foreach ($programs as $p): ?>
                                     <tr>
                                         <td><?php echo (int)$p->id; ?></td>
@@ -380,7 +376,6 @@ final class LFA_Scholarship_Admin {
                                                 <em>Schedule TBA (Closed)</em>
                                             <?php endif; ?>
                                         </td>
-                                        <td><?php echo $p->guest_application_enabled ? 'Allowed' : 'Members Only'; ?></td>
                                         <td>
                                             <a href="<?php echo esc_url(admin_url('users.php?page=lfa-scholarship-programs&edit=' . $p->id)); ?>" class="button button-small">Edit</a>
                                         </td>
@@ -441,12 +436,6 @@ final class LFA_Scholarship_Admin {
                             <p>
                                 <label for="timezone"><strong>Timezone:</strong></label><br>
                                 <input type="text" name="timezone" id="timezone" class="widefat" value="<?php echo esc_attr($edit_program->timezone ?? 'America/New_York'); ?>">
-                            </p>
-                            <p>
-                                <label>
-                                    <input type="checkbox" name="guest_application_enabled" value="1" <?php checked(!empty($edit_program->guest_application_enabled)); ?>>
-                                    Allow Guest Submissions (Default is Members Only)
-                                </label>
                             </p>
                             <p>
                                 <button type="submit" class="button button-primary button-large">Save Program Configuration</button>

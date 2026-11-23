@@ -345,21 +345,14 @@ final class LFA_News {
         $image_alt = $thumb_id ? (string)get_post_meta($thumb_id, '_wp_attachment_image_alt', true) : esc_attr($post->post_title);
 
         if (empty($image_url)) {
-            $slug_img_map = [
-                '2027-conference-preparations'                 => 'conference-cinematic-bg.jpg',
-                'akpo-family-scholarship-expansion'            => 'scholarship-cap.jpg',
-                'dr-uche-igbokwe-keynote-announcement'         => 'omaha-podium-2025.jpg',
-                'alumni-executive-council-strategic-assembly'  => 'original-alumni-group.jpg',
-                'celebrating-alumni-academic-achievements'     => 'original-women-community-group.jpg',
-            ];
             $cat_img_map = [
-                'awards-recognition' => 'original-women-community-group.jpg',
-                'chapter-spotlight'  => 'original-five-person-community.jpg',
+                'awards-recognition' => 'women-alumni-group.jpg',
+                'chapter-spotlight'  => 'omaha-podium-2025.jpg',
                 'obituaries'         => 'giving-heart.jpg',
-                'general'            => 'original-alumni-group.jpg',
+                'general'            => 'alumni-group-wide.jpg',
             ];
 
-            $img_file = $slug_img_map[$post->post_name] ?? ($cat_img_map[$cat_slug] ?? 'conference-cinematic-bg.jpg');
+            $img_file = $cat_img_map[$cat_slug] ?? 'Warm Banquet Gathering with Navy Overlay.png';
             $image_url = get_template_directory_uri() . '/assets/images/' . $img_file;
         }
 

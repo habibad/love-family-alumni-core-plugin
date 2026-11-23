@@ -673,15 +673,16 @@ final class LFA_Archives {
             'post_type'        => self::POST_TYPE_TIMELINE,
             'post_status'      => 'publish',
             'posts_per_page'   => 50,
-            'orderby'          => 'meta_value_num',
+            'orderby'          => ['meta_value_num' => 'ASC', 'menu_order' => 'ASC'],
             'meta_key'         => '_lfa_milestone_year',
-            'order'            => 'ASC',
             'suppress_filters' => true,
         ]);
 
         $milestones = [];
         foreach ($posts as $p) {
             $year = (int)get_post_meta($p->ID, '_lfa_milestone_year', true);
+            // Optional display label for spans such as "2021–2026".
+            $year_label = (string)get_post_meta($p->ID, '_lfa_milestone_year_label', true);
             $source = (string)get_post_meta($p->ID, '_lfa_milestone_source', true);
             $granularity = (string)get_post_meta($p->ID, '_lfa_milestone_granularity', true) ?: 'year';
 
@@ -691,6 +692,7 @@ final class LFA_Archives {
             $milestones[] = [
                 'id'          => $p->ID,
                 'year'        => $year,
+                'year_label'  => $year_label !== '' ? $year_label : (string)$year,
                 'title'       => $p->post_title,
                 'description' => wp_kses_post($p->post_content),
                 'source'      => $source,

@@ -25,6 +25,9 @@ final class LFA_Leadership {
         self::install_schema();
         add_action('admin_post_lfa_save_leadership_officer', [__CLASS__, 'handle_save_officer']);
         add_action('admin_post_lfa_delete_leadership_officer', [__CLASS__, 'handle_delete_officer']);
+        add_action('wp_ajax_lfa_save_leadership_officer', [__CLASS__, 'ajax_save_officer']);
+        add_action('wp_ajax_lfa_delete_leadership_officer', [__CLASS__, 'ajax_delete_officer']);
+        add_action('wp_ajax_lfa_get_leadership_officer', [__CLASS__, 'ajax_get_officer']);
     }
 
     public static function table_officers(): string {
@@ -44,6 +47,8 @@ final class LFA_Leadership {
             `name` VARCHAR(255) NOT NULL,
             `biography` TEXT NOT NULL,
             `photo_url` VARCHAR(500) NULL,
+            `email` VARCHAR(255) NULL,
+            `linkedin_url` VARCHAR(500) NULL,
             `org_level` VARCHAR(50) NOT NULL DEFAULT 'north_america',
             `chapter_name` VARCHAR(255) NULL,
             `committee` VARCHAR(255) NULL,
@@ -56,11 +61,23 @@ final class LFA_Leadership {
             `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (`id`),
             KEY `level_idx` (`org_level`),
+            KEY `committee_idx` (`committee`),
             KEY `status_idx` (`verification_status`),
             KEY `current_idx` (`is_current`)
         ) {$charset_collate};";
 
         dbDelta($sql);
+
+        // Ensure columns exist on already-created tables
+        $existing_cols = $wpdb->get_col("DESCRIBE `{$table}`");
+        if (is_array($existing_cols)) {
+            if (!in_array('email', $existing_cols, true)) {
+                $wpdb->query("ALTER TABLE `{$table}` ADD COLUMN `email` VARCHAR(255) NULL AFTER `photo_url`");
+            }
+            if (!in_array('linkedin_url', $existing_cols, true)) {
+                $wpdb->query("ALTER TABLE `{$table}` ADD COLUMN `linkedin_url` VARCHAR(500) NULL AFTER `email`");
+            }
+        }
 
         self::seed_verified_officers();
     }
@@ -152,6 +169,13 @@ final class LFA_Leadership {
         return $wpdb->get_results($sql, ARRAY_A);
     }
 
+    public static function get_officer_by_id(int $id): ?array {
+        global $wpdb;
+        $table = self::table_officers();
+        $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM `{$table}` WHERE `id` = %d", $id), ARRAY_A);
+        return $row ?: null;
+    }
+
     public static function save_officer(array $data, int $actor_id): array {
         if (!user_can($actor_id, LFA_Roles::CAP_MANAGE_LEADERSHIP) && !user_can($actor_id, 'administrator')) {
             return ['success' => false, 'error' => 'Unauthorized'];
@@ -160,59 +184,52 @@ final class LFA_Leadership {
         global $wpdb;
         $table = self::table_officers();
 
-        $title = sanitize_text_field($data['title'] ?? '');
-        $name = sanitize_text_field($data['name'] ?? '');
-        $biography = sanitize_textarea_field($data['biography'] ?? '');
-        $photo_url = esc_url_raw($data['photo_url'] ?? '');
-        $org_level = sanitize_key($data['org_level'] ?? self::LEVEL_NORTH_AMERICA);
+        $title        = sanitize_text_field($data['title'] ?? '');
+        $name         = sanitize_text_field($data['name'] ?? '');
+        $biography    = sanitize_textarea_field($data['biography'] ?? '');
+        $photo_url    = esc_url_raw($data['photo_url'] ?? '');
+        $email        = sanitize_email($data['email'] ?? '');
+        $linkedin_url = esc_url_raw($data['linkedin_url'] ?? '');
+        $org_level    = sanitize_key($data['org_level'] ?? self::LEVEL_NORTH_AMERICA);
         $chapter_name = sanitize_text_field($data['chapter_name'] ?? '');
-        $committee = sanitize_text_field($data['committee'] ?? '');
-        $term_start = (int)($data['term_start_year'] ?? date('Y'));
-        $term_end = !empty($data['term_end_year']) ? (int)$data['term_end_year'] : null;
-        $is_current = !empty($data['is_current']) ? 1 : 0;
+        $committee    = sanitize_text_field($data['committee'] ?? 'Executive Council');
+        $term_start   = (int)($data['term_start_year'] ?? date('Y'));
+        $term_end     = !empty($data['term_end_year']) ? (int)$data['term_end_year'] : null;
+        $is_current   = !empty($data['is_current']) ? 1 : 0;
         $verification = sanitize_key($data['verification_status'] ?? self::STATUS_VERIFIED);
-        $sort_order = (int)($data['sort_order'] ?? 0);
+        $sort_order   = (int)($data['sort_order'] ?? 0);
 
         if (empty($title) || empty($name)) {
             return ['success' => false, 'error' => 'Title and Name are required.'];
         }
 
         $id = !empty($data['id']) ? (int)$data['id'] : 0;
+        $payload = [
+            'title'               => $title,
+            'name'                => $name,
+            'biography'           => $biography,
+            'photo_url'           => $photo_url,
+            'email'               => $email,
+            'linkedin_url'        => $linkedin_url,
+            'org_level'           => $org_level,
+            'chapter_name'        => $chapter_name,
+            'committee'           => $committee,
+            'term_start_year'     => $term_start,
+            'term_end_year'       => $term_end,
+            'is_current'          => $is_current,
+            'verification_status' => $verification,
+            'sort_order'          => $sort_order,
+            'updated_at'          => current_time('mysql'),
+        ];
+
         if ($id > 0) {
-            $wpdb->update($table, [
-                'title'               => $title,
-                'name'                => $name,
-                'biography'           => $biography,
-                'photo_url'           => $photo_url,
-                'org_level'           => $org_level,
-                'chapter_name'        => $chapter_name,
-                'committee'           => $committee,
-                'term_start_year'     => $term_start,
-                'term_end_year'       => $term_end,
-                'is_current'          => $is_current,
-                'verification_status' => $verification,
-                'sort_order'          => $sort_order,
-                'updated_at'          => current_time('mysql'),
-            ], ['id' => $id]);
-            return ['success' => true, 'id' => $id, 'action' => 'updated'];
+            $wpdb->update($table, $payload, ['id' => $id]);
+            return ['success' => true, 'id' => $id, 'action' => 'updated', 'officer' => self::get_officer_by_id($id)];
         } else {
-            $wpdb->insert($table, [
-                'title'               => $title,
-                'name'                => $name,
-                'biography'           => $biography,
-                'photo_url'           => $photo_url,
-                'org_level'           => $org_level,
-                'chapter_name'        => $chapter_name,
-                'committee'           => $committee,
-                'term_start_year'     => $term_start,
-                'term_end_year'       => $term_end,
-                'is_current'          => $is_current,
-                'verification_status' => $verification,
-                'sort_order'          => $sort_order,
-                'created_at'          => current_time('mysql'),
-                'updated_at'          => current_time('mysql'),
-            ]);
-            return ['success' => true, 'id' => $wpdb->insert_id, 'action' => 'created'];
+            $payload['created_at'] = current_time('mysql');
+            $wpdb->insert($table, $payload);
+            $new_id = (int)$wpdb->insert_id;
+            return ['success' => true, 'id' => $new_id, 'action' => 'created', 'officer' => self::get_officer_by_id($new_id)];
         }
     }
 
@@ -221,10 +238,14 @@ final class LFA_Leadership {
             return ['success' => false, 'error' => 'Unauthorized'];
         }
 
+        if ($id <= 0) {
+            return ['success' => false, 'error' => 'Invalid leader ID.'];
+        }
+
         global $wpdb;
         $table = self::table_officers();
-        $wpdb->delete($table, ['id' => $id]);
-        return ['success' => true];
+        $deleted = $wpdb->delete($table, ['id' => $id]);
+        return ['success' => $deleted !== false];
     }
 
     public static function handle_save_officer(): void {
@@ -250,5 +271,43 @@ final class LFA_Leadership {
         ], wp_get_referer() ?: home_url('/admin-portal/#leadership'));
         wp_safe_redirect($redirect);
         exit;
+    }
+
+    public static function ajax_get_officer(): void {
+        check_ajax_referer('lfa_portal_nonce', 'nonce');
+        $actor_id = get_current_user_id();
+        if (!user_can($actor_id, LFA_Roles::CAP_MANAGE_LEADERSHIP) && !user_can($actor_id, 'administrator')) {
+            wp_send_json_error(['message' => 'Unauthorized'], 403);
+        }
+
+        $id = isset($_GET['id']) ? (int)$_GET['id'] : 0;
+        $officer = self::get_officer_by_id($id);
+        if (!$officer) {
+            wp_send_json_error(['message' => 'Leader not found'], 404);
+        }
+        wp_send_json_success($officer);
+    }
+
+    public static function ajax_save_officer(): void {
+        check_ajax_referer('lfa_portal_nonce', 'nonce');
+        $actor_id = get_current_user_id();
+        $res = self::save_officer($_POST, $actor_id);
+        if ($res['success']) {
+            wp_send_json_success($res);
+        } else {
+            wp_send_json_error($res);
+        }
+    }
+
+    public static function ajax_delete_officer(): void {
+        check_ajax_referer('lfa_portal_nonce', 'nonce');
+        $actor_id = get_current_user_id();
+        $id = isset($_POST['id']) ? (int)$_POST['id'] : 0;
+        $res = self::delete_officer($id, $actor_id);
+        if ($res['success']) {
+            wp_send_json_success($res);
+        } else {
+            wp_send_json_error($res);
+        }
     }
 }

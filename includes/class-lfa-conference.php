@@ -541,6 +541,8 @@ final class LFA_Conference {
             'program_info'    => sanitize_textarea_field($data['program_info'] ?? ''),
             'sponsorship'     => sanitize_textarea_field($data['sponsorship'] ?? ''),
             'refund_policy'   => sanitize_textarea_field($data['refund_policy'] ?? ''),
+            'banner_image_url'=> !empty($data['banner_image_url']) ? esc_url_raw($data['banner_image_url']) : '',
+            'banner_image_id' => !empty($data['banner_image_id']) ? (int)$data['banner_image_id'] : 0,
         ];
 
         $now = current_time('mysql', true);
@@ -610,6 +612,8 @@ final class LFA_Conference {
         if (isset($data['program_info'])) $details['program_info'] = sanitize_textarea_field($data['program_info']);
         if (isset($data['sponsorship'])) $details['sponsorship'] = sanitize_textarea_field($data['sponsorship']);
         if (isset($data['refund_policy'])) $details['refund_policy'] = sanitize_textarea_field($data['refund_policy']);
+        if (isset($data['banner_image_url'])) $details['banner_image_url'] = esc_url_raw($data['banner_image_url']);
+        if (isset($data['banner_image_id'])) $details['banner_image_id'] = (int)$data['banner_image_id'];
 
         $now = current_time('mysql', true);
         $update_fields = [
@@ -722,6 +726,212 @@ final class LFA_Conference {
     }
 
     /**
+     * Create a ticket category for any conference.
+     * Amount stays NULL when unknown (never treated as $0 / free).
+     */
+    public static function create_ticket_type(int $conference_id, array $data, int $actor_id): array {
+        if (!current_user_can(self::CAP_MANAGE_CONFERENCES)) {
+            return ['success' => false, 'code' => 'FORBIDDEN', 'error' => 'Unauthorized.'];
+        }
+        $conf = self::get_conference_by_id($conference_id);
+        if (!$conf) {
+            return ['success' => false, 'code' => 'NOT_FOUND', 'error' => 'Conference not found.'];
+        }
+
+        $name = sanitize_text_field($data['name'] ?? '');
+        if ($name === '') {
+            return ['success' => false, 'code' => 'REQUIRED_FIELDS', 'error' => 'Ticket category name is required.'];
+        }
+
+        global $wpdb;
+        $t_tickets = self::table_ticket_types();
+
+        // Unique slug per conference
+        $base = sanitize_title($data['slug'] ?? '') ?: sanitize_title($name);
+        $slug = $base;
+        $i    = 2;
+        while ($wpdb->get_var($wpdb->prepare("SELECT id FROM {$t_tickets} WHERE conference_id = %d AND slug = %s", $conference_id, $slug))) {
+            $slug = $base . '-' . $i++;
+        }
+
+        $amount_cents = $data['amount_cents'] ?? null;
+        $active       = !empty($data['active']) ? 1 : 0;
+        if ($active && (is_null($amount_cents) || (int)$amount_cents <= 0)) {
+            return ['success' => false, 'code' => 'PRICE_REQUIRED', 'error' => 'An active ticket category must have a confirmed positive USD price.'];
+        }
+
+        $eligibility = sanitize_key($data['eligibility'] ?? 'members_only');
+        if (!in_array($eligibility, ['members_only', 'members_and_guests'], true)) {
+            $eligibility = 'members_only';
+        }
+
+        $now = current_time('mysql', true);
+        $wpdb->insert($t_tickets, [
+            'conference_id'    => $conference_id,
+            'name'             => $name,
+            'slug'             => $slug,
+            'description'      => sanitize_textarea_field($data['description'] ?? ''),
+            'amount_cents'     => is_null($amount_cents) ? null : (int)$amount_cents,
+            'currency'         => 'USD',
+            'eligibility'      => $eligibility,
+            'capacity'         => isset($data['capacity']) && $data['capacity'] !== null ? (int)$data['capacity'] : null,
+            'registered_count' => 0,
+            'active'           => $active,
+            'policy_version'   => (string)$conf->policy_version,
+            'updated_by'       => $actor_id,
+            'created_at'       => $now,
+            'updated_at'       => $now,
+        ]);
+        $ticket_id = (int)$wpdb->insert_id;
+        if (!$ticket_id) {
+            return ['success' => false, 'code' => 'DB_ERROR', 'error' => 'Failed to create ticket category.'];
+        }
+
+        self::log_audit('admin', $actor_id, 'ticket_created', 'ticket_type', (string)$ticket_id, [
+            'conference_id' => $conference_id,
+            'name'          => $name,
+            'amount_cents'  => $amount_cents,
+            'active'        => $active,
+        ]);
+
+        return ['success' => true, 'ticket_id' => $ticket_id];
+    }
+
+    /**
+     * Delete a ticket category — refused once any registration references it.
+     */
+    public static function delete_ticket_type(int $ticket_id, int $actor_id): array {
+        if (!current_user_can(self::CAP_MANAGE_CONFERENCES)) {
+            return ['success' => false, 'code' => 'FORBIDDEN', 'error' => 'Unauthorized.'];
+        }
+        $ticket = self::get_ticket_type($ticket_id);
+        if (!$ticket) {
+            return ['success' => false, 'code' => 'NOT_FOUND', 'error' => 'Ticket category not found.'];
+        }
+
+        global $wpdb;
+        $t_reg = self::table_registrations();
+        $used  = (int)$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$t_reg} WHERE ticket_type_id = %d", $ticket_id));
+        if ($used > 0) {
+            return ['success' => false, 'code' => 'HAS_REGISTRATIONS', 'error' => 'This ticket category has registrations and cannot be deleted. Deactivate it instead.'];
+        }
+
+        $wpdb->delete(self::table_ticket_types(), ['id' => $ticket_id]);
+        self::log_audit('admin', $actor_id, 'ticket_deleted', 'ticket_type', (string)$ticket_id, [
+            'conference_id' => (int)$ticket->conference_id,
+            'name'          => $ticket->name,
+        ]);
+
+        return ['success' => true, 'conference_id' => (int)$ticket->conference_id];
+    }
+
+    /**
+     * Single source of truth for "can members register for this conference right now?"
+     *
+     * Registration window timestamps (registration_opens_at / closes_at) are stored in GMT.
+     *
+     * @return array{code:string,is_open:bool,label:string,message:string,tickets:array}
+     */
+    public static function get_registration_state(?object $conf): array {
+        $state = static fn(string $code, bool $open, string $label, string $msg, array $tickets = []) => [
+            'code' => $code, 'is_open' => $open, 'label' => $label, 'message' => $msg, 'tickets' => $tickets,
+        ];
+
+        if (!$conf) {
+            return $state('not_found', false, 'Unavailable', 'Conference record not found.');
+        }
+
+        $now_ts = current_time('timestamp', true);
+        $end_ts = !empty($conf->ends_at) ? strtotime($conf->ends_at) : 0;
+
+        if ($conf->published_status === 'archived') {
+            return $state('not_published', false, 'Archived', 'This conference has been archived.');
+        }
+        if ($conf->published_status !== 'published') {
+            return $state('not_published', false, 'Not Published', 'This conference has not been published yet. Publish it from the Conferences list before members can register.');
+        }
+        if ($end_ts && $end_ts < $now_ts) {
+            return $state('concluded', false, 'Concluded', 'This conference has concluded (end date ' . date_i18n('M j, Y', $end_ts) . '). Registration is closed.');
+        }
+        if ($conf->registration_status === 'paused') {
+            return $state('paused', false, 'Registration Paused', 'Registration is temporarily paused. Please check back soon.');
+        }
+        if ($conf->registration_status !== 'open') {
+            return $state('closed', false, 'Not Yet Open', 'Registration is not open yet. Ticket options and fees will be announced by the conference organizers.');
+        }
+
+        $opens_ts  = !empty($conf->registration_opens_at) ? strtotime($conf->registration_opens_at) : 0;
+        $closes_ts = !empty($conf->registration_closes_at) ? strtotime($conf->registration_closes_at) : 0;
+
+        if ($opens_ts && $opens_ts > $now_ts) {
+            return $state('not_started', false, 'Opens Soon', 'Registration opens ' . wp_date('F j, Y \a\t g:i A', $opens_ts) . '.');
+        }
+        if ($closes_ts && $closes_ts < $now_ts) {
+            return $state('expired', false, 'Registration Closed', 'The registration deadline has passed.');
+        }
+
+        $tickets = self::get_ticket_types((int)$conf->id, true);
+        $tickets = array_values(array_filter($tickets, static fn($t) => (int)$t->amount_cents > 0));
+        if (empty($tickets)) {
+            return $state('no_tickets', false, 'Not Yet Open', 'Ticket categories and fees are pending administrator configuration.');
+        }
+
+        $msg = 'Registration is open.';
+        if ($closes_ts) {
+            $msg .= ' Deadline: ' . wp_date('F j, Y', $closes_ts) . '.';
+        }
+        return $state('open', true, 'Registration Open', $msg, $tickets);
+    }
+
+    /**
+     * Published conferences that currently accept registrations.
+     */
+    public static function get_registrable_conferences(): array {
+        $out = [];
+        foreach (self::get_published_conferences() as $c) {
+            if (self::get_registration_state($c)['is_open']) {
+                $out[] = $c;
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * Published conferences that have not ended (ordered by start date).
+     */
+    public static function get_upcoming_conferences(): array {
+        $now_ts = current_time('timestamp', true);
+        return array_values(array_filter(self::get_published_conferences(), static function ($c) use ($now_ts) {
+            $end = !empty($c->ends_at) ? strtotime($c->ends_at) : strtotime($c->starts_at);
+            return $end && $end >= $now_ts;
+        }));
+    }
+
+    /**
+     * Human-readable date range for a conference ("August 12–15, 2027").
+     */
+    public static function format_date_range(?object $conf): string {
+        if (!$conf || empty($conf->starts_at)) {
+            return 'Dates to be announced';
+        }
+        $s = strtotime($conf->starts_at);
+        $e = !empty($conf->ends_at) ? strtotime($conf->ends_at) : $s;
+        if ($e < $s) {
+            $e = $s;
+        }
+        if (date('Y-m-d', $s) === date('Y-m-d', $e)) {
+            return date_i18n('F j, Y', $s);
+        }
+        if (date('Y-m', $s) === date('Y-m', $e)) {
+            return date_i18n('F j', $s) . '–' . date_i18n('j, Y', $e);
+        }
+        if (date('Y', $s) === date('Y', $e)) {
+            return date_i18n('M j', $s) . ' – ' . date_i18n('M j, Y', $e);
+        }
+        return date_i18n('M j, Y', $s) . ' – ' . date_i18n('M j, Y', $e);
+    }
+
+    /**
      * Audit logger for conference subsystem
      * PII and secrets are strictly scrubbed
      */
@@ -759,29 +969,22 @@ final class LFA_Conference {
             return ['valid' => false, 'code' => 'CONF_NOT_FOUND', 'error' => 'Conference record not found.'];
         }
 
-        // 1. Check conference registration status
-        if ($conf->registration_status !== 'open') {
-            return [
-                'valid' => false,
-                'code'  => 'REGISTRATION_CLOSED',
-                'error' => 'Conference registration is currently closed or pending announcement. Please check back soon.',
+        // 1. Conference must be published, not concluded, open, within window, with active priced tickets
+        $reg_state = self::get_registration_state($conf);
+        if (!$reg_state['is_open']) {
+            $code_map = [
+                'not_published' => 'REGISTRATION_CLOSED',
+                'concluded'     => 'REGISTRATION_EXPIRED',
+                'paused'        => 'REGISTRATION_PAUSED',
+                'closed'        => 'REGISTRATION_CLOSED',
+                'not_started'   => 'REGISTRATION_NOT_STARTED',
+                'expired'       => 'REGISTRATION_EXPIRED',
+                'no_tickets'    => 'REGISTRATION_CLOSED',
             ];
-        }
-
-        // Check registration window if dates configured
-        $now_ts = current_time('timestamp', true);
-        if (!empty($conf->registration_opens_at) && strtotime($conf->registration_opens_at) > $now_ts) {
             return [
                 'valid' => false,
-                'code'  => 'REGISTRATION_NOT_STARTED',
-                'error' => 'Conference registration has not opened yet.',
-            ];
-        }
-        if (!empty($conf->registration_closes_at) && strtotime($conf->registration_closes_at) < $now_ts) {
-            return [
-                'valid' => false,
-                'code'  => 'REGISTRATION_EXPIRED',
-                'error' => 'Conference registration deadline has passed.',
+                'code'  => $code_map[$reg_state['code']] ?? 'REGISTRATION_CLOSED',
+                'error' => $reg_state['message'],
             ];
         }
 
@@ -880,11 +1083,22 @@ final class LFA_Conference {
                 $user_id
             ));
             if ($existing) {
+                $t_cinv = self::table_invoices();
+                $existing_inv = $wpdb->get_row($wpdb->prepare(
+                    "SELECT id, invoice_number, amount_cents FROM {$t_cinv} WHERE registration_id = %d AND status = 'unpaid' ORDER BY id DESC LIMIT 1",
+                    $existing->id
+                ));
+                $existing_full = $wpdb->get_row($wpdb->prepare("SELECT registration_number, ticket_name_snapshot, amount_cents_snapshot FROM {$t_reg} WHERE id = %d", $existing->id));
                 return [
-                    'valid' => false,
-                    'code'  => 'DUPLICATE_REGISTRATION',
-                    'error' => 'You already have an active registration for ' . esc_html($conf->title) . ' (Status: ' . esc_html(ucfirst(str_replace('_', ' ', $existing->status))) . ').',
-                    'existing_registration_id' => $existing->id,
+                    'valid'                    => false,
+                    'code'                     => 'DUPLICATE_REGISTRATION',
+                    'error'                    => 'You already have an active registration for ' . esc_html($conf->title) . ' (Status: ' . esc_html(ucfirst(str_replace('_', ' ', $existing->status))) . ').',
+                    'existing_registration_id' => (int)$existing->id,
+                    'registration_number'      => $existing_full ? $existing_full->registration_number : '',
+                    'status'                   => $existing->status,
+                    'ticket_name'              => $existing_full ? $existing_full->ticket_name_snapshot : '',
+                    'invoice_id'               => $existing_inv ? (int)$existing_inv->id : null,
+                    'amount_dollars'           => $existing_full ? number_format($existing_full->amount_cents_snapshot / 100, 2) : '150.00',
                 ];
             }
         }
@@ -1202,7 +1416,8 @@ final class LFA_Conference {
             return true; // Idempotently avoid double emails
         }
 
-        $conf = self::get_conference();
+        $conf = self::get_conference_by_id((int)$reg->conference_id);
+        $conf_title = $conf ? $conf->title : 'Love Family Alumni Conference';
         $amount_str = '$' . number_format($reg->amount_cents_snapshot / 100, 2) . ' USD';
 
         $att_lines = [];
@@ -1211,23 +1426,28 @@ final class LFA_Conference {
         }
         $att_text = implode("\n", $att_lines);
 
-        $subject = "Registration Confirmed — 2027 Love Family Alumni Biennial Conference (#{$reg->registration_number})";
+        $subject = "Registration Confirmed — {$conf_title} (#{$reg->registration_number})";
+
+        $theme_line = '';
+        if ($conf && $conf->theme) {
+            $theme_line = "Theme:             “" . $conf->theme . "”" . ($conf->verse ? " (" . $conf->verse . ")" : '') . "\n";
+        }
 
         $message = "Dear " . esc_html($recipient_name) . ",\n\n"
-            . "We are delighted to confirm your registration for the 2027 Love Family Alumni Biennial Conference!\n\n"
+            . "We are delighted to confirm your registration for the " . esc_html($conf_title) . "!\n\n"
             . "CONFERENCE DETAILS:\n"
             . "--------------------------------------------------\n"
-            . "Event:             " . esc_html($conf ? $conf->title : '2027 Biennial Conference') . "\n"
-            . "Theme:             “" . esc_html($conf ? $conf->theme : 'Thy Kingdom Come') . "” (" . esc_html($conf ? $conf->verse : 'Matthew 6:10') . ")\n"
-            . "Dates:             September 16–19, 2027\n"
-            . "Location:          North America Zone (Host City TBA)\n"
+            . "Event:             " . esc_html($conf_title) . "\n"
+            . esc_html($theme_line)
+            . "Dates:             " . self::format_date_range($conf) . "\n"
+            . "Location:          " . esc_html(($conf && $conf->location_summary) ? $conf->location_summary : 'To be announced') . "\n"
             . "--------------------------------------------------\n\n"
             . "REGISTRATION & PAYMENT SUMMARY:\n"
             . "--------------------------------------------------\n"
             . "Registration No:   " . esc_html($reg->registration_number) . "\n"
             . "Ticket Type:       " . esc_html($reg->ticket_name_snapshot) . "\n"
             . "Amount Paid:       " . esc_html($amount_str) . "\n"
-            . "PayPal Reference:  " . esc_html($capture_id) . "\n"
+            . "Payment Reference: " . esc_html($capture_id) . "\n"
             . "Registration Date: " . current_time('mysql') . "\n"
             . "Status:            CONFIRMED\n"
             . "--------------------------------------------------\n\n"
@@ -1296,17 +1516,18 @@ final class LFA_Conference {
             ));
         }
 
-        $conf = self::get_conference();
+        $conf = self::get_conference_by_id((int)$reg->conference_id);
         $user = $reg->owner_user_id ? get_user_by('id', (int)$reg->owner_user_id) : null;
 
         return [
             'registration_id'     => $reg->id,
             'registration_number' => $reg->registration_number,
             'invoice_number'      => $inv ? $inv->invoice_number : 'N/A',
-            'conference_title'    => $conf ? $conf->title : '2027 Biennial Conference',
-            'theme'               => $conf ? $conf->theme : 'Thy Kingdom Come',
-            'verse'               => $conf ? $conf->verse : 'Matthew 6:10',
-            'dates'               => 'September 16–19, 2027',
+            'conference_title'    => $conf ? $conf->title : 'Love Family Alumni Conference',
+            'theme'               => $conf ? $conf->theme : '',
+            'verse'               => $conf ? $conf->verse : '',
+            'dates'               => self::format_date_range($conf),
+            'location'            => $conf ? $conf->location_summary : '',
             'ticket_name'         => $reg->ticket_name_snapshot,
             'registrant_name'     => $user ? $user->display_name : ($attendees[0]->full_name ?? 'Alumni Registrant'),
             'registrant_email'    => $user ? $user->user_email : ($reg->guest_email ?: ''),
@@ -1384,12 +1605,14 @@ final class LFA_Conference {
                     <div class="cell">
                         <small>CONFERENCE</small>
                         <strong><?php echo esc_html($r['conference_title']); ?></strong><br>
-                        <span style="font-size:12px;color:#c6933d;font-weight:600;">“<?php echo esc_html($r['theme']); ?>” (<?php echo esc_html($r['verse']); ?>)</span>
+                        <?php if (!empty($r['theme'])) : ?>
+                        <span style="font-size:12px;color:#c6933d;font-weight:600;">“<?php echo esc_html($r['theme']); ?>”<?php echo !empty($r['verse']) ? ' (' . esc_html($r['verse']) . ')' : ''; ?></span>
+                        <?php endif; ?>
                     </div>
                     <div class="cell">
                         <small>EVENT DATES</small>
                         <strong><?php echo esc_html($r['dates']); ?></strong><br>
-                        <span style="font-size:12px;color:#64748b;">North America Zone</span>
+                        <span style="font-size:12px;color:#64748b;"><?php echo esc_html(!empty($r['location']) ? $r['location'] : 'North America Zone'); ?></span>
                     </div>
                     <div class="cell">
                         <small>REGISTRATION NUMBER</small>

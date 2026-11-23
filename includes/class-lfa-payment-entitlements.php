@@ -9,8 +9,7 @@
  * 4. Staging / Test Paid Isolation vs Production Paid Privileges
  * 5. Conference Attendance Status
  * 6. Business Listing Moderation
- * 7. Scholarship Eligibility
- * 8. Organizational Administrative / Staff Roles (NEVER granted by payment)
+ * 7. Organizational Administrative / Staff Roles (NEVER granted by payment)
  *
  * @package Love_Family_Core
  */
@@ -381,17 +380,6 @@ final class LFA_Payment_Entitlements {
     }
 
     /**
-     * Check if user is eligible to apply for scholarships.
-     * Rule: Requires full paid membership standing unless guest applications permitted.
-     */
-    public static function can_apply_scholarship(int $user_id, ?object $program = null): bool {
-        if ($program && !empty($program->guest_application_enabled)) {
-            return true;
-        }
-        return self::is_full_member($user_id, true);
-    }
-
-    /**
      * Check if user can submit a business listing.
      * Rule: Requires BOTH approval AND verified paid annual dues.
      */
@@ -607,7 +595,6 @@ final class LFA_Payment_Entitlements {
             'can_access_directory'   => self::can_access_directory($user_id),
             'can_register_conference'=> self::can_register_conference($user_id),
             'can_register_business'  => self::can_register_business($user_id),
-            'can_apply_scholarship'  => self::can_apply_scholarship($user_id),
             'starts_at'              => $dues_info['starts_at'] ?? null,
             'ends_at'                => $dues_info['ends_at'] ?? null,
             'diagnosed_at'           => current_time('mysql', true),

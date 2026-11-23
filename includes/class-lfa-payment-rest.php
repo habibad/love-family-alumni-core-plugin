@@ -192,18 +192,32 @@ final class LFA_Payment_REST {
     }
 
     /**
-     * Reconcile Session upon Return from Stripe Hosted Checkout
+     * Reconcile Session upon Return from Hosted Checkout (PayPal or Stripe)
      */
     public static function handle_reconcile_session(WP_REST_Request $request): WP_REST_Response {
         $user_id = get_current_user_id();
         $session_id = sanitize_text_field((string)$request->get_param('session_id'));
         $payable_type = sanitize_key((string)($request->get_param('payable_type') ?: 'membership_due'));
+        $gateway = sanitize_key((string)$request->get_param('gateway'));
+
+        // If gateway is explicitly paypal or session_id is a PayPal order ID (doesn't start with cs_ or cs_test_)
+        if ($gateway === 'paypal' || (!str_starts_with($session_id, 'cs_test_') && !str_starts_with($session_id, 'cs_'))) {
+            $res = LFA_Payment_Service::capture_and_settle($session_id, $user_id, '', $payable_type);
+            if (!$res['success']) {
+                return new WP_REST_Response([
+                    'success' => false,
+                    'message' => $res['error'] ?? 'PayPal payment settlement failed.',
+                ], 400);
+            }
+            $res['reconciled'] = true;
+            return new WP_REST_Response($res, 200);
+        }
 
         $res = LFA_Payment_Reconciliation::settle_stripe_session($session_id, $user_id, $payable_type);
         if (!$res['success']) {
             return new WP_REST_Response([
                 'success' => false,
-                'message' => $res['error'],
+                'message' => $res['error'] ?? 'Stripe payment settlement failed.',
             ], 400);
         }
 

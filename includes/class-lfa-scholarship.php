@@ -5,6 +5,8 @@
  * Implements scholarship programs, student applications, academic records,
  * personal statements, secure supporting documents outside webroot,
  * recommendations, multi-tier staff reviews, decisions, and audit logging.
+ * Applications come from the public application form and are open to every
+ * applicant worldwide: no account, approval, or membership dues are required.
  *
  * @package Love_Family_Core
  */
@@ -54,10 +56,8 @@ final class LFA_Scholarship {
         add_action('init', [__CLASS__, 'register_capabilities_and_roles']);
         add_action('admin_post_lfa_download_scholarship_doc', [__CLASS__, 'handle_download_document']);
         add_action('admin_post_nopriv_lfa_download_scholarship_doc', [__CLASS__, 'handle_download_document_anon']);
-        add_action('admin_post_lfa_member_save_scholarship_draft', [__CLASS__, 'handle_member_save_draft']);
-        add_action('admin_post_lfa_member_submit_scholarship', [__CLASS__, 'handle_member_submit']);
-        add_action('admin_post_lfa_member_upload_scholarship_doc', [__CLASS__, 'handle_member_upload_doc']);
-        add_action('admin_post_lfa_member_respond_info', [__CLASS__, 'handle_member_respond_info']);
+        add_action('admin_post_lfa_submit_scholarship_application', [__CLASS__, 'handle_public_submit']);
+        add_action('admin_post_nopriv_lfa_submit_scholarship_application', [__CLASS__, 'handle_public_submit']);
     }
 
 
@@ -163,7 +163,6 @@ final class LFA_Scholarship {
             currency varchar(10) NULL,
             status varchar(30) NOT NULL DEFAULT 'closed',
             capacity int(11) NULL,
-            guest_application_enabled tinyint(1) NOT NULL DEFAULT 0,
             policy_version varchar(50) NOT NULL DEFAULT 'v1.0-unconfigured',
             details_json longtext NULL,
             created_by bigint(20) unsigned NULL,
@@ -348,7 +347,6 @@ final class LFA_Scholarship {
             'currency'                 => null,
             'status'                   => self::PROGRAM_CLOSED,
             'capacity'                 => null,
-            'guest_application_enabled'=> 0,
             'policy_version'           => 'v1.0-unconfigured',
             'details_json'             => json_encode([
                 'sponsor'          => 'The Akpo Family',
@@ -417,146 +415,31 @@ final class LFA_Scholarship {
         return $wpdb->get_row($wpdb->prepare("SELECT * FROM {$t} WHERE application_ref = %s", $ref));
     }
 
-    public static function get_user_applications(int $user_id): array {
-        global $wpdb;
-        $t_app = self::table_applications();
-        $t_prog = self::table_programs();
-        return $wpdb->get_results($wpdb->prepare(
-            "SELECT a.*, p.title as program_title, p.slug as program_slug, p.status as program_status
-             FROM {$t_app} a
-             INNER JOIN {$t_prog} p ON a.program_id = p.id
-             WHERE a.owner_user_id = %d
-             ORDER BY a.id DESC",
-            $user_id
-        ));
-    }
-
     public static function generate_application_ref(): string {
         return 'SCH-' . date('Y') . '-' . strtoupper(bin2hex(random_bytes(4)));
     }
 
     /**
-     * Create or update draft application
+     * Create and submit an application from the public application form.
+     * Open to every applicant: no account, approval, or membership dues are required.
+     * Validated and idempotent; the optional supporting document is checked before anything is saved.
      */
-    public static function save_draft(array $data, int $user_id): array {
+    public static function submit_application(array $data, array $file, int $user_id): array {
         global $wpdb;
         $t_app = self::table_applications();
-        $now = current_time('mysql', true);
 
-        $program_id = (int)($data['program_id'] ?? 0);
-        $program = self::get_program($program_id);
+        $program = self::get_program((int)($data['program_id'] ?? 0));
         if (!$program) {
-            return ['success' => false, 'code' => 'INVALID_PROGRAM', 'message' => 'Scholarship program not found.'];
+            return ['success' => false, 'code' => 'PROGRAM_NOT_FOUND', 'message' => 'Scholarship program not found.'];
         }
 
-        // Access check: If anonymous, check guest policy
-        if ($user_id <= 0 && empty($program->guest_application_enabled)) {
-            return ['success' => false, 'code' => 'LOGIN_REQUIRED', 'message' => 'You must sign in with an approved alumni account to apply.'];
-        }
-
-        $app_id = (int)($data['application_id'] ?? 0);
-        if ($app_id > 0) {
-            $existing = self::get_application($app_id);
-            if (!$existing) {
-                return ['success' => false, 'code' => 'NOT_FOUND', 'message' => 'Application draft not found.'];
+        // A repeated submission of the same form returns the original application (Idempotency)
+        $idempotency_key = sanitize_text_field($data['idempotency_key'] ?? '');
+        if ($idempotency_key !== '') {
+            $existing_ref = $wpdb->get_var($wpdb->prepare("SELECT application_ref FROM {$t_app} WHERE idempotency_key = %s", $idempotency_key));
+            if ($existing_ref) {
+                return ['success' => true, 'application_ref' => $existing_ref];
             }
-            // Strict ownership check
-            if ($user_id > 0 && (int)$existing->owner_user_id !== $user_id && !current_user_can(self::CAP_MANAGE_SCHOLARSHIPS)) {
-                return ['success' => false, 'code' => 'FORBIDDEN', 'message' => 'Unauthorized: Cannot modify an application belonging to another applicant.'];
-            }
-            if ($existing->status !== self::STATUS_DRAFT && $existing->status !== self::STATUS_ADDITIONAL_INFO_REQUIRED) {
-                return ['success' => false, 'code' => 'IMMUTABLE_STATUS', 'message' => 'Submitted applications cannot be edited as draft.'];
-            }
-
-            $wpdb->update($t_app, [
-                'applicant_name'       => sanitize_text_field($data['applicant_name'] ?? $existing->applicant_name),
-                'applicant_email'      => sanitize_email($data['applicant_email'] ?? $existing->applicant_email),
-                'applicant_phone'      => sanitize_text_field($data['applicant_phone'] ?? $existing->applicant_phone),
-                'school_name'          => sanitize_text_field($data['school_name'] ?? $existing->school_name),
-                'program_of_study'     => sanitize_text_field($data['program_of_study'] ?? $existing->program_of_study),
-                'academic_level'       => sanitize_text_field($data['academic_level'] ?? $existing->academic_level),
-                'gpa_academic_details' => sanitize_textarea_field($data['gpa_academic_details'] ?? $existing->gpa_academic_details),
-                'personal_statement'   => wp_kses_post($data['personal_statement'] ?? $existing->personal_statement),
-                'revision_version'     => (int)$existing->revision_version + 1,
-                'updated_at'           => $now,
-            ], ['id' => $app_id]);
-
-            self::log_audit($app_id, $user_id, 'member', 'draft_updated', $existing->status, $existing->status, 'Application draft updated.');
-            return ['success' => true, 'application_id' => $app_id, 'application_ref' => $existing->application_ref, 'status' => self::STATUS_DRAFT];
-        }
-
-        // Create new draft
-        $ref = self::generate_application_ref();
-        $applicant_user = ($user_id > 0) ? get_user_by('id', $user_id) : null;
-        $name = sanitize_text_field($data['applicant_name'] ?? ($applicant_user ? $applicant_user->display_name : ''));
-        $email = sanitize_email($data['applicant_email'] ?? ($applicant_user ? $applicant_user->user_email : ''));
-
-        $wpdb->insert($t_app, [
-            'application_ref'      => $ref,
-            'program_id'           => $program_id,
-            'owner_user_id'        => ($user_id > 0) ? $user_id : null,
-            'applicant_name'       => $name,
-            'applicant_email'      => $email,
-            'applicant_phone'      => sanitize_text_field($data['applicant_phone'] ?? ''),
-            'school_name'          => sanitize_text_field($data['school_name'] ?? ''),
-            'program_of_study'     => sanitize_text_field($data['program_of_study'] ?? ''),
-            'academic_level'       => sanitize_text_field($data['academic_level'] ?? ''),
-            'gpa_academic_details' => sanitize_textarea_field($data['gpa_academic_details'] ?? ''),
-            'personal_statement'   => wp_kses_post($data['personal_statement'] ?? ''),
-            'status'               => self::STATUS_DRAFT,
-            'idempotency_key'      => !empty($data['idempotency_key']) ? sanitize_text_field($data['idempotency_key']) : null,
-            'consent_agreed'       => 1,
-            'consent_version'      => 'v1.0',
-            'revision_version'     => 1,
-            'created_at'           => $now,
-            'updated_at'           => $now,
-        ]);
-
-        $new_id = (int)$wpdb->insert_id;
-        self::log_audit($new_id, $user_id, 'member', 'draft_created', null, self::STATUS_DRAFT, 'Application draft created.');
-        return ['success' => true, 'application_id' => $new_id, 'application_ref' => $ref, 'status' => self::STATUS_DRAFT];
-    }
-
-    /**
-     * Submit application (Transactional, Idempotent, Validated)
-     */
-    public static function submit_application(int $app_id, int $user_id, string $idempotency_key = ''): array {
-        global $wpdb;
-
-        // Server-side Paid Member Standing Enforcement
-        if ($user_id > 0 && class_exists('LFA_Payment_Entitlements') && !LFA_Payment_Entitlements::is_full_member($user_id)) {
-            return [
-                'success' => false,
-                'code'    => 'MEMBERSHIP_DUES_REQUIRED',
-                'message' => 'Scholarship applications require an approved alumni account in good standing with settled annual membership dues ($100.00 USD).',
-            ];
-        }
-
-        $t_app = self::table_applications();
-        $app = self::get_application($app_id);
-        if (!$app) {
-            return ['success' => false, 'code' => 'NOT_FOUND', 'message' => 'Application record not found.'];
-        }
-
-        // Ownership check
-        if ($user_id > 0 && (int)$app->owner_user_id !== $user_id && !current_user_can(self::CAP_MANAGE_SCHOLARSHIPS)) {
-            return ['success' => false, 'code' => 'FORBIDDEN', 'message' => 'Unauthorized: Cannot submit an application for another applicant.'];
-        }
-
-        // Check already submitted (Idempotency)
-        if ($app->status !== self::STATUS_DRAFT) {
-            return [
-                'success'         => true,
-                'application_id'  => $app->id,
-                'application_ref' => $app->application_ref,
-                'status'          => $app->status,
-                'message'         => 'Application has already been submitted and is in status: ' . $app->status,
-            ];
-        }
-
-        $program = self::get_program((int)$app->program_id);
-        if (!$program) {
-            return ['success' => false, 'code' => 'PROGRAM_NOT_FOUND', 'message' => 'Associated scholarship program not found.'];
         }
 
         // Check if application window is open
@@ -568,149 +451,126 @@ final class LFA_Scholarship {
             ];
         }
 
+        $name      = sanitize_text_field($data['applicant_name'] ?? '');
+        $email     = sanitize_email($data['applicant_email'] ?? '');
+        $school    = sanitize_text_field($data['school_name'] ?? '');
+        $major     = sanitize_text_field($data['program_of_study'] ?? '');
+        $statement = sanitize_textarea_field($data['personal_statement'] ?? '');
+
         // Server-side required field validation
         $errors = [];
-        if (empty(trim($app->applicant_name))) { $errors[] = 'Full applicant name is required.'; }
-        if (empty(trim($app->applicant_email)) || !is_email($app->applicant_email)) { $errors[] = 'A valid applicant email address is required.'; }
-        if (empty(trim($app->school_name))) { $errors[] = 'Current school / institution name is required.'; }
-        if (empty(trim($app->program_of_study))) { $errors[] = 'Program of study / major is required.'; }
-        if (empty(trim($app->personal_statement)) || strlen(trim($app->personal_statement)) < 50) {
-            $errors[] = 'A personal statement of at least 50 characters is required.';
+        if ($name === '') { $errors[] = 'Full applicant name is required.'; }
+        if (!is_email($email)) { $errors[] = 'A valid applicant email address is required.'; }
+        if ($school === '') { $errors[] = 'Current school / institution name is required.'; }
+        if ($major === '') { $errors[] = 'Program of study / major is required.'; }
+        if (mb_strlen($statement) < 50) { $errors[] = 'A personal statement of at least 50 characters is required.'; }
+        if (empty($data['consent_agreed'])) { $errors[] = 'Please confirm that the information you submitted is accurate.'; }
+
+        $document = null;
+        if (!empty($file)) {
+            $document = self::validate_document($file);
+            if (isset($document['error'])) { $errors[] = $document['error']; }
         }
 
         if (!empty($errors)) {
             return ['success' => false, 'code' => 'VALIDATION_FAILED', 'message' => implode(' ', $errors)];
         }
 
-        // Verify idempotency key if provided
-        if (!empty($idempotency_key)) {
-            $existing_key = $wpdb->get_var($wpdb->prepare(
-                "SELECT id FROM {$t_app} WHERE idempotency_key = %s AND id != %d",
-                $idempotency_key,
-                $app_id
-            ));
-            if ($existing_key) {
-                return ['success' => false, 'code' => 'DUPLICATE_REQUEST', 'message' => 'This application submission has already been processed.'];
-            }
-        }
-
         $now = current_time('mysql', true);
-        $update_data = [
-            'status'           => self::STATUS_SUBMITTED,
-            'submitted_at'     => $now,
-            'revision_version' => (int)$app->revision_version + 1,
-            'updated_at'       => $now,
-        ];
-        if (!empty($idempotency_key)) {
-            $update_data['idempotency_key'] = sanitize_text_field($idempotency_key);
+        $ref = self::generate_application_ref();
+        $inserted = $wpdb->insert($t_app, [
+            'application_ref'      => $ref,
+            'program_id'           => (int)$program->id,
+            'owner_user_id'        => ($user_id > 0) ? $user_id : null,
+            'applicant_name'       => $name,
+            'applicant_email'      => $email,
+            'school_name'          => $school,
+            'program_of_study'     => $major,
+            'academic_level'       => sanitize_text_field($data['academic_level'] ?? ''),
+            'gpa_academic_details' => sanitize_textarea_field($data['gpa_academic_details'] ?? ''),
+            'personal_statement'   => $statement,
+            'status'               => self::STATUS_SUBMITTED,
+            'idempotency_key'      => ($idempotency_key !== '') ? $idempotency_key : null,
+            'consent_agreed'       => 1,
+            'consent_version'      => 'v1.0',
+            'submitted_at'         => $now,
+            'created_at'           => $now,
+            'updated_at'           => $now,
+        ]);
+        if (!$inserted) {
+            return ['success' => false, 'code' => 'STORAGE_ERROR', 'message' => 'Your application could not be saved. Please try again.'];
         }
 
-        $wpdb->update($t_app, $update_data, ['id' => $app_id]);
+        $app = self::get_application((int)$wpdb->insert_id);
+        self::log_audit((int)$app->id, $user_id, 'applicant', 'submitted', null, self::STATUS_SUBMITTED, 'Application submitted via the public application form.');
 
-        self::log_audit($app_id, $user_id, 'member', 'submitted', self::STATUS_DRAFT, self::STATUS_SUBMITTED, 'Application submitted by applicant.');
+        if ($document) {
+            self::store_document($app, $file, $document, $user_id);
+        }
 
         // Dispatch genuine confirmation email via wp_mail
         self::send_application_email($app, 'submitted');
 
-        return [
-            'success'         => true,
-            'application_id'  => $app->id,
-            'application_ref' => $app->application_ref,
-            'status'          => self::STATUS_SUBMITTED,
-            'message'         => 'Your application for ' . esc_html($program->title) . ' has been submitted successfully! Application reference: ' . esc_html($app->application_ref),
-        ];
+        return ['success' => true, 'application_ref' => $ref];
     }
 
-    /* Document Upload & Storage Outside Web Root */
-    public static function handle_document_upload(int $app_id, string $category, array $file, int $user_id): array {
-        global $wpdb;
-        $app = self::get_application($app_id);
-        if (!$app) {
-            return ['success' => false, 'code' => 'NOT_FOUND', 'message' => 'Application not found.'];
+    /**
+     * Validate an uploaded supporting document: PDF, JPG or PNG up to 5MB (strict finfo MIME check).
+     * Returns the detected MIME type, stored extension and display name, or an error message.
+     */
+    private static function validate_document(array $file): array {
+        if ((int)($file['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK || empty($file['tmp_name']) || !is_uploaded_file($file['tmp_name'])) {
+            return ['error' => 'The supporting document could not be uploaded. Please attach a PDF, JPG, or PNG file up to 5MB.'];
         }
 
-        // Ownership or reviewer check
-        if ($user_id > 0 && (int)$app->owner_user_id !== $user_id && !current_user_can(self::CAP_REVIEW_SCHOLARSHIPS)) {
-            return ['success' => false, 'code' => 'FORBIDDEN', 'message' => 'Unauthorized: You do not have permission to attach documents to this application.'];
+        if ((int)$file['size'] > 5242880) {
+            return ['error' => 'File size exceeds 5MB limit.'];
         }
 
-        if (empty($file['tmp_name']) || !file_exists($file['tmp_name'])) {
-            return ['success' => false, 'code' => 'NO_FILE', 'message' => 'No file was uploaded.'];
-        }
-
-        // Max size: 5MB
-        if ($file['size'] > 5242880) {
-            return ['success' => false, 'code' => 'FILE_TOO_LARGE', 'message' => 'File size exceeds 5MB limit.'];
-        }
-
-        // Strict finfo MIME check
         $finfo = finfo_open(FILEINFO_MIME_TYPE);
         $mime = finfo_file($finfo, $file['tmp_name']);
         finfo_close($finfo);
 
-        $allowed_mimes = [
-            'application/pdf',
-            'image/jpeg',
-            'image/png',
-        ];
-        if (!in_array($mime, $allowed_mimes, true)) {
-            return [
-                'success' => false,
-                'code'    => 'INVALID_MIME',
-                'message' => 'Invalid file format. Only PDF, JPG, and PNG documents are permitted. Executables, scripts, HTML, SVG, and archives are strictly prohibited.',
-            ];
+        $allowed_mimes = ['application/pdf' => 'pdf', 'image/jpeg' => 'jpg', 'image/png' => 'png'];
+        $name = sanitize_file_name($file['name'] ?? 'document');
+        $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+        if (!isset($allowed_mimes[$mime]) || !in_array($ext, ['pdf', 'jpg', 'jpeg', 'png'], true)) {
+            return ['error' => 'Invalid file format. Only PDF, JPG, and PNG documents are permitted.'];
         }
 
-        // Extension check
-        $orig_name = sanitize_file_name($file['name'] ?? 'document');
-        $ext = strtolower(pathinfo($orig_name, PATHINFO_EXTENSION));
-        $disallowed_extensions = ['php', 'phtml', 'html', 'htm', 'svg', 'js', 'exe', 'bat', 'cmd', 'sh', 'zip', 'tar', 'gz', 'rar'];
-        if (in_array($ext, $disallowed_extensions, true)) {
-            return ['success' => false, 'code' => 'PROHIBITED_EXTENSION', 'message' => 'Prohibited file extension.'];
-        }
+        return ['mime' => $mime, 'ext' => $allowed_mimes[$mime], 'name' => $name];
+    }
 
+    /* Document Storage Outside Web Root */
+    private static function store_document(object $app, array $file, array $document, int $user_id): void {
+        global $wpdb;
         self::ensure_storage_dir();
 
         $doc_ref = 'DOC-' . strtoupper(bin2hex(random_bytes(8)));
-        $stored_filename = 'lfa_doc_' . $app->application_ref . '_' . bin2hex(random_bytes(6)) . '.' . ($ext ?: 'dat');
+        $stored_filename = 'lfa_doc_' . $app->application_ref . '_' . bin2hex(random_bytes(6)) . '.' . $document['ext'];
         $dest_path = self::PRIVATE_STORAGE_PATH . $stored_filename;
 
         if (!move_uploaded_file($file['tmp_name'], $dest_path)) {
-            if (!copy($file['tmp_name'], $dest_path)) {
-                return ['success' => false, 'code' => 'STORAGE_ERROR', 'message' => 'Could not save file to secure storage.'];
-            }
-            @unlink($file['tmp_name']);
+            self::log_audit((int)$app->id, $user_id, 'system', 'document_storage_failed', null, null, 'Could not save supporting document to secure storage: ' . $document['name']);
+            return;
         }
 
-        $file_hash = hash_file('sha256', $dest_path);
-        $now = current_time('mysql', true);
-        $t_docs = self::table_documents();
-
-        $wpdb->insert($t_docs, [
-            'application_id'   => $app_id,
-            'owner_user_id'    => ($user_id > 0) ? $user_id : $app->owner_user_id,
-            'category'         => sanitize_key($category ?: 'supporting_doc'),
+        $wpdb->insert(self::table_documents(), [
+            'application_id'   => (int)$app->id,
+            'owner_user_id'    => $app->owner_user_id,
+            'category'         => 'transcript',
             'document_ref'     => $doc_ref,
-            'display_filename' => $orig_name,
+            'display_filename' => $document['name'],
             'stored_filename'  => $stored_filename,
-            'mime_type'        => $mime,
+            'mime_type'        => $document['mime'],
             'file_size'        => (int)$file['size'],
-            'file_hash'        => $file_hash,
+            'file_hash'        => hash_file('sha256', $dest_path),
             'scan_state'       => 'unscanned',
             'is_private'       => 1,
-            'created_at'       => $now,
+            'created_at'       => current_time('mysql', true),
         ]);
 
-        $doc_id = (int)$wpdb->insert_id;
-        self::log_audit($app_id, $user_id, 'member', 'document_uploaded', null, null, 'Uploaded supporting document: ' . $orig_name . ' [Ref: ' . $doc_ref . ']');
-
-        return [
-            'success'          => true,
-            'document_id'      => $doc_id,
-            'document_ref'     => $doc_ref,
-            'display_filename' => $orig_name,
-            'file_size'        => (int)$file['size'],
-        ];
+        self::log_audit((int)$app->id, $user_id, 'applicant', 'document_uploaded', null, null, 'Uploaded supporting document: ' . $document['name'] . ' [Ref: ' . $doc_ref . ']');
     }
 
     /**
@@ -973,13 +833,13 @@ final class LFA_Scholarship {
         if ($event_type === 'submitted') {
             $body .= "Thank you for submitting your application for " . $program_title . ".\n\n";
             $body .= "Your application reference number is: " . $app->application_ref . "\n";
-            $body .= "Our scholarship committee will review your submission in accordance with established program guidelines. You can monitor the status of your application from your member portal.\n";
+            $body .= "Our scholarship committee will review your submission in accordance with established program guidelines. We will contact you at this email address with any updates on your application.\n";
         } elseif ($event_type === 'info_requested') {
             $body .= "The scholarship review committee has requested additional information regarding your application (" . $app->application_ref . ").\n\n";
             if (!empty($extra_note)) {
                 $body .= "Committee Feedback / Details Needed:\n" . esc_html($extra_note) . "\n\n";
             }
-            $body .= "Please log in to your Love Family Alumni member dashboard to review and submit the requested details.\n";
+            $body .= "Please reply to this email with the requested details and include your application reference (" . $app->application_ref . ").\n";
         } elseif ($event_type === 'decision_awarded') {
             $body .= "Congratulations! We are pleased to inform you that your application (" . $app->application_ref . ") for " . $program_title . " has been approved for award.\n\n";
             $body .= "The committee will contact you regarding the formal verification and award distribution steps.\n";
@@ -1023,156 +883,44 @@ final class LFA_Scholarship {
         ]);
     }
 
-    /* Member Form Handlers (admin-post) */
-    public static function handle_member_save_draft(): void {
-        if (!is_user_logged_in()) {
-            wp_safe_redirect(home_url('/member-login/?lfa_notice=login_required'));
+    /* Public Application Form Handler (admin-post, guests and signed-in visitors alike) */
+    public static function handle_public_submit(): void {
+        // Honeypot anti-spam field must stay empty
+        if (!empty($_POST['lfa_scholarship_hp'])) {
+            wp_die('Invalid submission.', 'Security Error', ['response' => 400]);
+        }
+
+        check_admin_referer('lfa_scholarship_apply', 'lfa_scholarship_nonce');
+
+        $back = home_url('/scholarships/');
+
+        // IP rate limit: at most 5 submitted applications per hour
+        $rate_key = 'lfa_sch_apply_' . substr(hash_hmac('sha256', (string)($_SERVER['REMOTE_ADDR'] ?? 'unknown'), wp_salt('auth')), 0, 28);
+        $submitted_count = (int)get_transient($rate_key);
+        if ($submitted_count >= 5) {
+            wp_safe_redirect(add_query_arg('lfa_error', rawurlencode('You have submitted several applications recently. Please wait an hour before submitting another.'), $back) . '#scholarship-application');
             exit;
         }
 
-        check_admin_referer('lfa_member_scholarship_action', 'lfa_scholarship_nonce');
+        $file = $_FILES['document_file'] ?? [];
+        if ((int)($file['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_NO_FILE) {
+            $file = [];
+        }
 
-        $user_id = get_current_user_id();
-        $app_id = isset($_POST['application_id']) ? (int)$_POST['application_id'] : 0;
-        $program_id = isset($_POST['program_id']) ? (int)$_POST['program_id'] : 0;
+        $data = [];
+        foreach (['program_id', 'applicant_name', 'applicant_email', 'school_name', 'program_of_study', 'academic_level', 'gpa_academic_details', 'personal_statement', 'consent_agreed', 'idempotency_key'] as $field) {
+            $data[$field] = (isset($_POST[$field]) && is_scalar($_POST[$field])) ? wp_unslash((string)$_POST[$field]) : '';
+        }
 
-        $data = [
-            'id'                   => $app_id,
-            'program_id'           => $program_id,
-            'applicant_name'       => sanitize_text_field(wp_unslash($_POST['applicant_name'] ?? '')),
-            'applicant_email'      => sanitize_email(wp_unslash($_POST['applicant_email'] ?? '')),
-            'applicant_phone'      => sanitize_text_field(wp_unslash($_POST['applicant_phone'] ?? '')),
-            'school_name'          => sanitize_text_field(wp_unslash($_POST['school_name'] ?? '')),
-            'program_of_study'     => sanitize_text_field(wp_unslash($_POST['program_of_study'] ?? '')),
-            'academic_level'       => sanitize_text_field(wp_unslash($_POST['academic_level'] ?? '')),
-            'gpa_academic_details' => sanitize_textarea_field(wp_unslash($_POST['gpa_academic_details'] ?? '')),
-            'personal_statement'   => wp_kses_post(wp_unslash($_POST['personal_statement'] ?? '')),
-        ];
-
-        $res = self::save_draft($data, $user_id);
+        $res = self::submit_application($data, $file, get_current_user_id());
         if ($res['success']) {
-            wp_safe_redirect(home_url('/member-dashboard/?lfa_notice=scholarship_draft_saved#scholarships'));
+            set_transient($rate_key, $submitted_count + 1, HOUR_IN_SECONDS);
+            $back = add_query_arg('lfa_notice', 'scholarship_submitted', $back);
         } else {
-            wp_safe_redirect(home_url('/member-dashboard/?lfa_error=' . urlencode($res['message']) . '#scholarships'));
-        }
-        exit;
-    }
-
-    public static function handle_member_submit(): void {
-        if (!is_user_logged_in()) {
-            wp_safe_redirect(home_url('/member-login/?lfa_notice=login_required'));
-            exit;
+            $back = add_query_arg('lfa_error', rawurlencode($res['message']), $back);
         }
 
-        check_admin_referer('lfa_member_scholarship_action', 'lfa_scholarship_nonce');
-
-        $user_id = get_current_user_id();
-        $app_id = isset($_POST['application_id']) ? (int)$_POST['application_id'] : 0;
-        $program_id = isset($_POST['program_id']) ? (int)$_POST['program_id'] : 0;
-
-        $data = [
-            'id'                   => $app_id,
-            'program_id'           => $program_id,
-            'applicant_name'       => sanitize_text_field(wp_unslash($_POST['applicant_name'] ?? '')),
-            'applicant_email'      => sanitize_email(wp_unslash($_POST['applicant_email'] ?? '')),
-            'applicant_phone'      => sanitize_text_field(wp_unslash($_POST['applicant_phone'] ?? '')),
-            'school_name'          => sanitize_text_field(wp_unslash($_POST['school_name'] ?? '')),
-            'program_of_study'     => sanitize_text_field(wp_unslash($_POST['program_of_study'] ?? '')),
-            'academic_level'       => sanitize_text_field(wp_unslash($_POST['academic_level'] ?? '')),
-            'gpa_academic_details' => sanitize_textarea_field(wp_unslash($_POST['gpa_academic_details'] ?? '')),
-            'personal_statement'   => wp_kses_post(wp_unslash($_POST['personal_statement'] ?? '')),
-        ];
-
-        $draft_res = self::save_draft($data, $user_id);
-        if (!$draft_res['success']) {
-            wp_safe_redirect(home_url('/member-dashboard/?lfa_error=' . urlencode($draft_res['message']) . '#scholarships'));
-            exit;
-        }
-
-        $app_id = $draft_res['application_id'];
-
-        if (!empty($_FILES['document_file']['tmp_name'])) {
-            $cat = sanitize_key($_POST['document_category'] ?? 'transcript');
-            $upload_res = self::handle_document_upload($app_id, $cat, $_FILES['document_file'], $user_id);
-            if (!$upload_res['success']) {
-                wp_safe_redirect(home_url('/member-dashboard/?lfa_error=' . urlencode($upload_res['message']) . '#scholarships'));
-                exit;
-            }
-        }
-
-        $idempotency_key = sanitize_text_field(wp_unslash($_POST['idempotency_key'] ?? ''));
-        $submit_res = self::submit_application($app_id, $user_id, $idempotency_key);
-        if ($submit_res['success']) {
-            wp_safe_redirect(home_url('/member-dashboard/?lfa_notice=scholarship_submitted#scholarships'));
-        } else {
-            wp_safe_redirect(home_url('/member-dashboard/?lfa_error=' . urlencode($submit_res['message']) . '#scholarships'));
-        }
-        exit;
-    }
-
-    public static function handle_member_upload_doc(): void {
-        if (!is_user_logged_in()) {
-            wp_safe_redirect(home_url('/member-login/?lfa_notice=login_required'));
-            exit;
-        }
-
-        check_admin_referer('lfa_member_scholarship_action', 'lfa_scholarship_nonce');
-
-        $user_id = get_current_user_id();
-        $app_id = isset($_POST['application_id']) ? (int)$_POST['application_id'] : 0;
-        $category = sanitize_key($_POST['document_category'] ?? 'supporting_doc');
-
-        if (empty($_FILES['document_file']['tmp_name'])) {
-            wp_safe_redirect(home_url('/member-dashboard/?lfa_error=' . urlencode('Please select a valid document file to upload.') . '#scholarships'));
-            exit;
-        }
-
-        $res = self::handle_document_upload($app_id, $category, $_FILES['document_file'], $user_id);
-        if ($res['success']) {
-            wp_safe_redirect(home_url('/member-dashboard/?lfa_notice=scholarship_doc_uploaded#scholarships'));
-        } else {
-            wp_safe_redirect(home_url('/member-dashboard/?lfa_error=' . urlencode($res['message']) . '#scholarships'));
-        }
-        exit;
-    }
-
-    public static function handle_member_respond_info(): void {
-        if (!is_user_logged_in()) {
-            wp_safe_redirect(home_url('/member-login/?lfa_notice=login_required'));
-            exit;
-        }
-
-        check_admin_referer('lfa_member_scholarship_action', 'lfa_scholarship_nonce');
-
-        $user_id = get_current_user_id();
-        $app_id = isset($_POST['application_id']) ? (int)$_POST['application_id'] : 0;
-        $response_text = sanitize_textarea_field(wp_unslash($_POST['applicant_response'] ?? ''));
-
-        $app = self::get_application($app_id);
-        if (!$app || (int)$app->owner_user_id !== $user_id) {
-            wp_safe_redirect(home_url('/member-dashboard/?lfa_error=' . urlencode('Application not found or unauthorized.') . '#scholarships'));
-            exit;
-        }
-
-        if (!empty($_FILES['document_file']['tmp_name'])) {
-            $cat = sanitize_key($_POST['document_category'] ?? 'additional_info');
-            $upload_res = self::handle_document_upload($app_id, $cat, $_FILES['document_file'], $user_id);
-            if (!$upload_res['success']) {
-                wp_safe_redirect(home_url('/member-dashboard/?lfa_error=' . urlencode($upload_res['message']) . '#scholarships'));
-                exit;
-            }
-        }
-
-        global $wpdb;
-        $now = current_time('mysql', true);
-        $wpdb->update(self::table_applications(), [
-            'status'     => self::STATUS_UNDER_REVIEW,
-            'updated_at' => $now,
-        ], ['id' => $app_id]);
-
-        self::log_audit($app_id, $user_id, 'member', 'applicant_responded', $app->status, self::STATUS_UNDER_REVIEW, 'Applicant response: ' . $response_text);
-
-        wp_safe_redirect(home_url('/member-dashboard/?lfa_notice=scholarship_info_submitted#scholarships'));
+        wp_safe_redirect($back . '#scholarship-application');
         exit;
     }
 }

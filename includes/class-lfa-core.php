@@ -186,19 +186,14 @@ final class LFA_Core {
             'login_rejected'         => 'Your alumni membership application was not approved. Please contact the membership team for details.',
             'login_invalid'          => 'Invalid email address or password. Please try again.',
             'reset_sent'             => 'If an account exists with that email address, password recovery instructions have been sent.',
-            'scholarship_draft_saved' => 'Your scholarship application draft has been saved.',
-            'scholarship_submitted'   => 'Your scholarship application has been successfully submitted! A confirmation email has been dispatched.',
-            'scholarship_doc_uploaded' => 'Supporting document uploaded successfully to secure private storage.',
-            'scholarship_info_submitted' => 'Additional information submitted successfully. The review committee has been notified.',
-            'scholarship_closed'     => 'Applications are currently closed for this scholarship program.',
-            'scholarship_error'      => 'An error occurred with your scholarship request. Please review the details and try again.',
+            'scholarship_submitted'  => 'Your scholarship application has been successfully submitted! A confirmation email has been dispatched.',
         ];
         if (!empty($_GET['lfa_error'])) {
             $err = sanitize_text_field(wp_unslash($_GET['lfa_error']));
             return '<div class="lfa-account-notice alert-error" role="status">' . esc_html($err) . '</div>';
         }
         if (!isset($messages[$key])) { return ''; }
-        $is_success = in_array($key, ['registered', 'verified', 'approved', 'profile_saved', 'avatar_updated', 'avatar_deleted', 'reset_sent', 'scholarship_draft_saved', 'scholarship_submitted', 'scholarship_doc_uploaded', 'scholarship_info_submitted'], true);
+        $is_success = in_array($key, ['registered', 'verified', 'approved', 'profile_saved', 'avatar_updated', 'avatar_deleted', 'reset_sent', 'scholarship_submitted'], true);
         $cls = $is_success ? 'alert-success' : 'alert-error';
         return '<div class="lfa-account-notice ' . esc_attr($cls) . '" role="status">' . esc_html($messages[$key]) . '</div>';
     }
